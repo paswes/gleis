@@ -157,10 +157,19 @@ load_config() {
   source "$chosen"
   CONFIG_FILE="$chosen"
 
-  # Required fields
-  [[ -n "${SCHEME:-}" ]]    || die "config $chosen: missing SCHEME"
-  [[ -n "${PROJECT:-}" ]]   || die "config $chosen: missing PROJECT"
-  [[ -n "${BUNDLE_ID:-}" ]] || die "config $chosen: missing BUNDLE_ID"
+  # Required fields — collect all missing so the user can fix them in one pass.
+  local missing_vars=()
+  [[ -n "${SCHEME:-}" ]]    || missing_vars+=("SCHEME")
+  [[ -n "${PROJECT:-}" ]]   || missing_vars+=("PROJECT")
+  [[ -n "${BUNDLE_ID:-}" ]] || missing_vars+=("BUNDLE_ID")
+  if (( ${#missing_vars[@]} )); then
+    die "config $chosen is missing: ${missing_vars[*]}
+  set the missing variable(s), e.g.:
+    SCHEME=\"MyApp\"
+    PROJECT=\"MyApp.xcodeproj\"
+    BUNDLE_ID=\"com.example.app\"
+  or regenerate the config from scratch: gleis init  (see also config/example.conf)"
+  fi
 
   # Derive PRODUCT_NAME from SCHEME if not set
   [[ -n "$PRODUCT_NAME" ]] || PRODUCT_NAME="$SCHEME"
@@ -214,13 +223,18 @@ select_worktree() {
   local preselect="${1:-}" rows choice
 
   rows=$(list_worktrees)
-  [[ -n "$rows" ]] || die "no worktrees with $PROJECT found"
+  [[ -n "$rows" ]] || die "no worktrees contain $PROJECT
+  - run 'git worktree list' to see your worktrees
+  - check that PROJECT=\"$PROJECT\" in your config matches an existing .xcodeproj/.xcworkspace
+  - add one with: git worktree add <path> <branch>"
 
   if [[ -n "$preselect" ]]; then
     choice=$(echo "$rows" | awk -F'\t' -v q="$preselect" '
       tolower($2) ~ tolower(q) || tolower($1) ~ tolower(q)
     ' | head -1)
-    [[ -n "$choice" ]] || die "no worktree matches '$preselect'"
+    [[ -n "$choice" ]] || die "no worktree matches '$preselect'. Available:
+$(echo "$rows" | awk -F'\t' '{printf "    %s\n", $2}')
+  retry with a more specific substring, or run 'gleis' to pick interactively"
   else
     choice=$(echo "$rows" | fzf \
       --prompt="worktree ❯ " \
@@ -287,7 +301,10 @@ list_devices() {
 select_destination() {
   local rows choice
   rows=$( { list_devices; list_simulators; } )
-  [[ -n "$rows" ]] || die "no destinations found"
+  [[ -n "$rows" ]] || die "no destinations found
+  - boot a simulator: open -a Simulator  (or 'xcrun simctl boot <name>')
+  - or connect an iPhone, unlock it, and trust this Mac
+  - run 'gleis doctor' to see what gleis can find"
 
   choice=$(echo "$rows" | fzf \
     --prompt="destination ❯ " \
@@ -333,7 +350,10 @@ ensure_local_files() {
 
   donor=$(find_donor_worktree || true)
   if [[ -z "$donor" || "$donor" == "$target" ]]; then
-    die "no other worktree has these files — regenerate them then re-run gleis"
+    die "no other worktree has the LOCAL_FILES listed in $CONFIG_FILE
+  these are gitignored files (secrets, keys, generated config) that gleis copies
+  between worktrees. No source worktree has them yet — recreate them in this
+  worktree the way you originally generated them, then re-run gleis."
   fi
 
   info "copying from $(basename "$donor")"
