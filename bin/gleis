@@ -119,7 +119,11 @@ repo_root() {
 # Per-project state file: one cache slot per repo, keyed by repo name
 state_file_for_repo() {
   local repo="$1"
-  printf '%s/%s' "$STATE_DIR" "$(basename "$repo")"
+  # basename keeps the filename human-readable; the path hash disambiguates two
+  # repos that share a name in different directories (which would otherwise
+  # collide and clobber each other's "last run").
+  printf '%s/%s-%s' "$STATE_DIR" "$(basename "$repo")" \
+    "$(printf '%s' "$repo" | shasum -a 1 | cut -c1-8)"
 }
 
 load_config() {
@@ -156,6 +160,10 @@ load_config() {
   # shellcheck disable=SC1090
   source "$chosen"
   CONFIG_FILE="$chosen"
+
+  # A config may legally omit (or unset) LOCAL_FILES; keep it a defined array
+  # so later "${LOCAL_FILES[@]}" expansions are safe under `set -u`.
+  declare -p LOCAL_FILES >/dev/null 2>&1 || LOCAL_FILES=()
 
   # Required fields — collect all missing so the user can fix them in one pass.
   local missing_vars=()
@@ -420,7 +428,8 @@ build_and_launch() {
   )
 
   if command -v xcbeautify >/dev/null 2>&1; then
-    set -o pipefail
+    # pipefail is already on globally (set -euo pipefail at the top), so a
+    # failing xcodebuild still aborts the run even though its output is piped.
     "${xc_cmd[@]}" 2>&1 | xcbeautify --quiet
   else
     "${xc_cmd[@]}"
