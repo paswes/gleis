@@ -104,6 +104,15 @@ for arg in "$@"; do
   esac
 done
 
+# `ship` is a leading subcommand with its own `init` sub-subcommand, so it's
+# detected on $1 here rather than via the keyword scan above — otherwise
+# `gleis ship init` would trip the `init)` arm and run the project init. Like
+# the others, its implementation is deferred to the dispatch tail. Plain
+# `gleis ship` keeps the normal dep-check (it needs the build toolchain).
+if [[ "${1:-}" == "ship" ]]; then
+  GLEIS_SHIP_MODE=1
+fi
+
 # Required runtime tools — checked here for normal commands. doctor, init, and
 # prune bypass this (they work without a full build toolchain).
 if [[ -z "${GLEIS_DOCTOR_MODE:-}" && -z "${GLEIS_INIT_MODE:-}" && -z "${GLEIS_PRUNE_MODE:-}" ]]; then
@@ -171,6 +180,17 @@ load_config() {
   CONFIG="Debug"
   PRODUCT_NAME=""
   LOCAL_FILES=()
+  # Ship (gleis ship) settings — optional here, validated only when `ship` runs
+  # (require_ship_config), so build-only projects never need them. Defined up
+  # front so reads stay safe under `set -u`.
+  TEAM_ID=""
+  SHIP_DOMAIN=""
+  VERCEL_PROJECT=""
+  SHIP_CONFIG="Release"
+  SHIP_METHOD="release-testing"
+  SHIP_SIGNING="automatic"
+  SHIP_TITLE=""
+  EXPORT_OPTIONS=""
 
   # shellcheck disable=SC1090
   source "$chosen"
@@ -196,6 +216,9 @@ load_config() {
 
   # Derive PRODUCT_NAME from SCHEME if not set
   [[ -n "$PRODUCT_NAME" ]] || PRODUCT_NAME="$SCHEME"
+
+  # SHIP_TITLE shows on the iOS OTA install sheet; default it to the product.
+  [[ -n "$SHIP_TITLE" ]] || SHIP_TITLE="$PRODUCT_NAME"
 
   # Detect project vs workspace from extension. Used for xcodebuild flag.
   case "$PROJECT" in
@@ -683,6 +706,32 @@ load_state() {
   [[ -n "${LAST_WORKTREE:-}" && -d "$LAST_WORKTREE" ]]
 }
 
+# Ship state lives in a sibling file to the build/launch state so the two never
+# collide. Records the last shipped build and the install URL it produced.
+ship_state_file_for_repo() {
+  printf '%s.ship' "$(state_file_for_repo "$1")"
+}
+
+# Written by the (upcoming) deploy step; read here so `gleis ship` can show the
+# previous install URL. Mirrors save_state/load_state's quoted, source-able form.
+save_ship_state() {
+  local state_file="$1" version="$2" build="$3" url="$4"
+  {
+    printf 'LAST_SHIP_VERSION=%q\n' "$version"
+    printf 'LAST_SHIP_BUILD=%q\n'   "$build"
+    printf 'LAST_SHIP_URL=%q\n'     "$url"
+    printf 'LAST_SHIP_AT=%q\n'      "$(date '+%Y-%m-%d %H:%M:%S')"
+  } > "$state_file"
+}
+
+load_ship_state() {
+  local state_file="$1"
+  [[ -f "$state_file" ]] || return 1
+  # shellcheck disable=SC1090
+  source "$state_file"
+  [[ -n "${LAST_SHIP_URL:-}" ]]
+}
+
 # ─── init ────────────────────────────────────────────────────────────────────
 
 # Prompt with a default value. Echoes the user's input, or the default if blank.
@@ -901,6 +950,186 @@ init() {
   printf "    2. Verify setup:           gleis doctor\n"
   printf "    3. Commit when ready:      git add .gleis.conf && git commit -m \"Add gleis config\"\n"
   printf "    4. Build & launch:         gleis\n\n"
+}
+
+# ─── ship ────────────────────────────────────────────────────────────────────
+
+# Ship layers on top of the build config (SCHEME/PROJECT/BUNDLE_ID): it archives
+# a signed ad-hoc .ipa, writes an OTA install manifest, deploys both to Vercel,
+# and prints an install URL. Its extra config lives in the same .gleis.conf but
+# is validated only here, so build-only projects never need it.
+#
+# NOTE: this is phase-1 scaffolding. `ship` validates config and resolves paths;
+# the archive, export, manifest, and Vercel deploy steps land in a follow-up.
+
+# Detect the signing team (DEVELOPMENT_TEAM) from the project file. Echoes the
+# most common value, or nothing. Mirrors _detect_bundle_id's pbxproj grep.
+_detect_team_id() {
+  local repo="$1" project="$2" pbxproj
+  if [[ "$project" == *.xcworkspace ]]; then
+    pbxproj=$(find "$repo" -maxdepth 4 -name 'project.pbxproj' 2>/dev/null \
+              | grep -v "$project/" | head -1)
+  else
+    pbxproj="$repo/$project/project.pbxproj"
+  fi
+  [[ -f "$pbxproj" ]] || return 0
+  grep -oE 'DEVELOPMENT_TEAM = [^;]+;' "$pbxproj" 2>/dev/null \
+    | sed -E 's/^DEVELOPMENT_TEAM = "?([^";]+)"?;/\1/' \
+    | grep -v '^$' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+}
+
+# Validate the ship-only config fields. Collects everything missing so the user
+# fixes it in one pass; each line carries its fix (config var or `ship init`).
+require_ship_config() {
+  local missing=()
+  [[ -n "${TEAM_ID:-}" ]]        || missing+=("TEAM_ID")
+  [[ -n "${SHIP_DOMAIN:-}" ]]    || missing+=("SHIP_DOMAIN")
+  [[ -n "${VERCEL_PROJECT:-}" ]] || missing+=("VERCEL_PROJECT")
+  (( ${#missing[@]} == 0 )) && return 0
+  die "ship config in $CONFIG_FILE is missing: ${missing[*]}
+  add the ship settings, e.g.:
+    TEAM_ID=\"ABCDE12345\"
+    SHIP_DOMAIN=\"install.example.app\"
+    VERCEL_PROJECT=\"your-vercel-project\"
+  or fill them in interactively: gleis ship init"
+}
+
+# `gleis ship init` — add/update the ship settings block in .gleis.conf.
+# Requires an existing build config (ship extends it). Auto-detects TEAM_ID.
+ship_init() {
+  printf "\n%s── gleis ship init ──%s\n\n" "$c_bold" "$c_reset"
+
+  local repo
+  repo=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || {
+    die "not in a git repo — cd into your iOS project, then run 'gleis ship init' again"
+  }
+  info "repo: $repo"
+
+  local conf="$repo/.gleis.conf"
+  [[ -f "$conf" ]] || die "no .gleis.conf in this repo yet
+  ship settings extend your build config (SCHEME/PROJECT/BUNDLE_ID).
+  create it first with: gleis init"
+
+  # Seed defaults from the existing config so re-running shows current values.
+  # Only the fields ship_init reads are declared local; any others the config
+  # sets are harmless to leave to the source.
+  local SCHEME="" PROJECT="" BUNDLE_ID=""
+  local TEAM_ID="" SHIP_DOMAIN="" VERCEL_PROJECT=""
+  local SHIP_CONFIG="Release" SHIP_METHOD="release-testing" SHIP_SIGNING="automatic"
+  # shellcheck disable=SC1090
+  source "$conf" 2>/dev/null || true
+  [[ -n "$SCHEME" && -n "$PROJECT" && -n "$BUNDLE_ID" ]] \
+    || die "$conf is missing SCHEME/PROJECT/BUNDLE_ID — run 'gleis init' first"
+
+  info "scanning project for signing team…"
+  local d_team
+  d_team=$(_detect_team_id "$repo" "$PROJECT")
+
+  printf "\n  Ship builds a signed ad-hoc .ipa and deploys it for OTA install.\n"
+  printf "  Required settings (press Enter to accept a detected/default value):\n\n"
+
+  local team domain vercel
+  team=$(_prompt   "TEAM_ID (Apple Developer team)"               "${TEAM_ID:-$d_team}")
+  domain=$(_prompt "SHIP_DOMAIN (install host, e.g. install.app)" "$SHIP_DOMAIN")
+  vercel=$(_prompt "VERCEL_PROJECT (Vercel deploy target)"        "$VERCEL_PROJECT")
+
+  [[ -n "$team" && -n "$domain" && -n "$vercel" ]] \
+    || die "TEAM_ID, SHIP_DOMAIN, and VERCEL_PROJECT are all required for ship"
+
+  printf "\n  ──\n"
+  printf "  Optional — press Enter to accept each default.\n"
+  printf "  ──\n\n"
+  local config method signing
+  config=$(_prompt  "SHIP_CONFIG (configuration to archive)" "${SHIP_CONFIG:-Release}")
+  method=$(_prompt  "SHIP_METHOD (export method)"            "${SHIP_METHOD:-release-testing}")
+  signing=$(_prompt "SHIP_SIGNING (automatic | manual)"      "${SHIP_SIGNING:-automatic}")
+
+  cp "$conf" "$conf.bak.$(date +%s)"
+  ok "backed up existing config to $conf.bak.*"
+  _ensure_gitignored "$repo" ".gleis.conf.bak.*"
+
+  # Rewrite: keep everything before any prior ship block (always written last),
+  # trim trailing blank lines, then append a fresh block. Read into a temp first
+  # so we never read and truncate $conf at the same time.
+  local tmp
+  tmp=$(mktemp)
+  awk '
+    /^# ── Ship ──/ { stop=1 }
+    !stop { lines[NR]=$0; if (NF) last=NR }
+    END   { for (i=1; i<=last; i++) print lines[i] }
+  ' "$conf" > "$tmp"
+  {
+    cat "$tmp"
+    # shellcheck disable=SC2016
+    printf '\n# ── Ship ── (gleis ship) — added by `gleis ship init` on %s\n' "$(date '+%Y-%m-%d')"
+    printf 'TEAM_ID=%q\n'        "$team"
+    printf 'SHIP_DOMAIN=%q\n'    "$domain"
+    printf 'VERCEL_PROJECT=%q\n' "$vercel"
+    printf 'SHIP_CONFIG=%q\n'    "$config"
+    printf 'SHIP_METHOD=%q\n'    "$method"
+    printf 'SHIP_SIGNING=%q\n'   "$signing"
+  } > "$conf"
+  rm -f "$tmp"
+
+  ok "updated $conf"
+  printf "\n  Next steps:\n"
+  printf "    1. Review:            cat .gleis.conf\n"
+  printf "    2. Commit when ready: git add .gleis.conf && git commit -m \"Add gleis ship config\"\n"
+  printf "    3. (soon) ship it:    gleis ship\n\n"
+}
+
+# `gleis ship` — build the current worktree into a signed ad-hoc .ipa, generate
+# an OTA manifest, deploy to Vercel, print an install URL. This phase validates
+# config and resolves paths; archive/export/manifest/deploy land next.
+ship() {
+  shift  # drop the leading "ship" subcommand
+
+  if [[ "${1:-}" == "init" ]]; then
+    shift
+    ship_init "$@"
+    return $?
+  fi
+
+  case "${1:-}" in
+    "")  ;;
+    -*)  die "unknown flag for ship: $1" ;;
+    *)   die "unknown argument for ship: $1 (did you mean 'gleis ship init'?)" ;;
+  esac
+
+  local repo worktree slug ship_dir
+  repo=$(repo_root)
+  load_config "$repo"
+  require_ship_config
+
+  worktree="$repo"            # ship targets the worktree you're standing in
+  slug=$(worktree_slug "$worktree")
+  ship_dir="$CACHE_DIR/ship/$slug"
+
+  printf "\n%s── gleis ship ──%s\n" "$c_bold" "$c_reset"
+  info "worktree:    $worktree"
+  info "scheme:      $SCHEME ($SHIP_CONFIG)"
+  info "bundle id:   $BUNDLE_ID"
+  info "team:        $TEAM_ID"
+  info "method:      $SHIP_METHOD  (signing: $SHIP_SIGNING)"
+  if [[ -n "$EXPORT_OPTIONS" ]]; then
+    info "export opts: $EXPORT_OPTIONS (custom plist)"
+  else
+    info "export opts: generated from team / method / signing"
+  fi
+  info "title:       $SHIP_TITLE"
+  info "deploy:      $VERCEL_PROJECT → https://$SHIP_DOMAIN"
+  info "artifacts:   $ship_dir"
+  info "config:      $CONFIG_FILE"
+
+  local ship_state
+  ship_state=$(ship_state_file_for_repo "$repo")
+  if load_ship_state "$ship_state"; then
+    info "last ship:   ${LAST_SHIP_VERSION:-?} (${LAST_SHIP_BUILD:-?}) → ${LAST_SHIP_URL:-?}"
+  fi
+
+  echo
+  warn "build + deploy aren't wired up yet — this scaffold only validates config"
+  info "coming next: xcodebuild archive → export .ipa → OTA manifest → Vercel deploy"
 }
 
 # ─── prune ───────────────────────────────────────────────────────────────────
@@ -1280,6 +1509,11 @@ main() {
   save_state "$state_file" "$worktree" "$kind" "$udid" "$display"
   build_and_launch "$worktree" "$kind" "$udid" "$display" "$clean" "$launch" "$logs" "$verbose_logs"
 }
+
+if [[ -n "${GLEIS_SHIP_MODE:-}" ]]; then
+  ship "$@"
+  exit $?
+fi
 
 if [[ -n "${GLEIS_INIT_MODE:-}" ]]; then
   init
