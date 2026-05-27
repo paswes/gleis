@@ -10,10 +10,16 @@
 #   gleis <branch-substring>      preselect worktree by branch fuzzy-match
 #   gleis -l, --logs              stream app logs after launch (Ctrl-C to stop)
 #   gleis --no-launch             build + install only, don't launch
-#   gleis --clean                 wipe this worktree's DerivedData first
+#   gleis --clean                 wipe THIS worktree's DerivedData, then build
 #   gleis init                    create .gleis.conf for the current project
 #   gleis doctor                  diagnose your gleis setup
+#   gleis prune [--all]           reclaim build-cache disk from deleted worktrees
 #   gleis --version               print version
+#
+# Examples:
+#   gleis                         first run: pick a worktree, then a destination
+#   gleis --last                  fastest inner loop: repeat the last build
+#   gleis polish -l               build the 'polish' worktree, then stream logs
 #
 # Requires: fzf, jq, xcodebuild, xcrun  (xcbeautify optional, used if present)
 #
@@ -36,7 +42,7 @@
 #                    (default: same as SCHEME)
 #     LOCAL_FILES  — array of gitignored files to auto-copy across worktrees
 
-readonly GLEIS_VERSION="1.0.0"
+readonly GLEIS_VERSION="1.1.0"
 
 set -euo pipefail
 
@@ -68,7 +74,7 @@ require() {
 for arg in "$@"; do
   case "$arg" in
     -h|--help)
-      sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     --version)
@@ -87,11 +93,17 @@ for arg in "$@"; do
       # who haven't installed everything yet.
       GLEIS_INIT_MODE=1
       ;;
+    prune)
+      # `prune` reclaims build-cache disk. It only touches the cache, so it
+      # bypasses the build-tool dep-check and never loads a project config.
+      GLEIS_PRUNE_MODE=1
+      ;;
   esac
 done
 
-# Required runtime tools — checked here for normal commands; doctor and init bypass this.
-if [[ -z "${GLEIS_DOCTOR_MODE:-}" && -z "${GLEIS_INIT_MODE:-}" ]]; then
+# Required runtime tools — checked here for normal commands. doctor, init, and
+# prune bypass this (they work without a full build toolchain).
+if [[ -z "${GLEIS_DOCTOR_MODE:-}" && -z "${GLEIS_INIT_MODE:-}" && -z "${GLEIS_PRUNE_MODE:-}" ]]; then
   require fzf jq xcodebuild xcrun
 fi
 
@@ -119,7 +131,11 @@ repo_root() {
 # Per-project state file: one cache slot per repo, keyed by repo name
 state_file_for_repo() {
   local repo="$1"
-  printf '%s/%s' "$STATE_DIR" "$(basename "$repo")"
+  # basename keeps the filename human-readable; the path hash disambiguates two
+  # repos that share a name in different directories (which would otherwise
+  # collide and clobber each other's "last run").
+  printf '%s/%s-%s' "$STATE_DIR" "$(basename "$repo")" \
+    "$(printf '%s' "$repo" | shasum -a 1 | cut -c1-8)"
 }
 
 load_config() {
@@ -157,10 +173,23 @@ load_config() {
   source "$chosen"
   CONFIG_FILE="$chosen"
 
-  # Required fields
-  [[ -n "${SCHEME:-}" ]]    || die "config $chosen: missing SCHEME"
-  [[ -n "${PROJECT:-}" ]]   || die "config $chosen: missing PROJECT"
-  [[ -n "${BUNDLE_ID:-}" ]] || die "config $chosen: missing BUNDLE_ID"
+  # A config may legally omit (or unset) LOCAL_FILES; keep it a defined array
+  # so later "${LOCAL_FILES[@]}" expansions are safe under `set -u`.
+  declare -p LOCAL_FILES >/dev/null 2>&1 || LOCAL_FILES=()
+
+  # Required fields — collect all missing so the user can fix them in one pass.
+  local missing_vars=()
+  [[ -n "${SCHEME:-}" ]]    || missing_vars+=("SCHEME")
+  [[ -n "${PROJECT:-}" ]]   || missing_vars+=("PROJECT")
+  [[ -n "${BUNDLE_ID:-}" ]] || missing_vars+=("BUNDLE_ID")
+  if (( ${#missing_vars[@]} )); then
+    die "config $chosen is missing: ${missing_vars[*]}
+  set the missing variable(s), e.g.:
+    SCHEME=\"MyApp\"
+    PROJECT=\"MyApp.xcodeproj\"
+    BUNDLE_ID=\"com.example.app\"
+  or regenerate the config from scratch: gleis init  (see also config/example.conf)"
+  fi
 
   # Derive PRODUCT_NAME from SCHEME if not set
   [[ -n "$PRODUCT_NAME" ]] || PRODUCT_NAME="$SCHEME"
@@ -195,18 +224,24 @@ $(echo "$schemes" | sed 's/^/    /')"
 
 # ─── worktrees ───────────────────────────────────────────────────────────────
 
-# Output: <path>\t<branch-or-HEAD>  for each worktree containing $PROJECT
-list_worktrees() {
-  local path branch repo
-  repo=$(repo_root)
+# Output: <path>\t<branch-or-HEAD>  for each worktree of repo $1 that contains
+# project $2. Takes both explicitly (rather than reading globals) so callers
+# that must not die — e.g. doctor — can use it without going through repo_root.
+_worktrees_with_project() {
+  local repo="$1" project="$2" path branch
   git -C "$repo" worktree list --porcelain | awk '
     /^worktree / { p=substr($0,10); b="(detached)"; next }
     /^branch /   { b=substr($0,8); sub(/^refs\/heads\//, "", b); next }
     /^$/         { if (p) print p "\t" b; p="" }
     END          { if (p) print p "\t" b }
   ' | while IFS=$'\t' read -r path branch; do
-    [[ -e "$path/$PROJECT" ]] && printf '%s\t%s\n' "$path" "$branch"
+    [[ -e "$path/$project" ]] && printf '%s\t%s\n' "$path" "$branch"
   done
+}
+
+# Output: <path>\t<branch-or-HEAD>  for each worktree containing $PROJECT
+list_worktrees() {
+  _worktrees_with_project "$(repo_root)" "$PROJECT"
 }
 
 # Echoes selected worktree path
@@ -214,13 +249,18 @@ select_worktree() {
   local preselect="${1:-}" rows choice
 
   rows=$(list_worktrees)
-  [[ -n "$rows" ]] || die "no worktrees with $PROJECT found"
+  [[ -n "$rows" ]] || die "no worktrees contain $PROJECT
+  - run 'git worktree list' to see your worktrees
+  - check that PROJECT=\"$PROJECT\" in your config matches an existing .xcodeproj/.xcworkspace
+  - add one with: git worktree add <path> <branch>"
 
   if [[ -n "$preselect" ]]; then
     choice=$(echo "$rows" | awk -F'\t' -v q="$preselect" '
       tolower($2) ~ tolower(q) || tolower($1) ~ tolower(q)
     ' | head -1)
-    [[ -n "$choice" ]] || die "no worktree matches '$preselect'"
+    [[ -n "$choice" ]] || die "no worktree matches '$preselect'. Available:
+$(echo "$rows" | awk -F'\t' '{printf "    %s\n", $2}')
+  retry with a more specific substring, or run 'gleis' to pick interactively"
   else
     choice=$(echo "$rows" | fzf \
       --prompt="worktree ❯ " \
@@ -261,13 +301,19 @@ list_simulators() {
     }'
 }
 
-list_devices() {
-  local tmp json
-  tmp=$(mktemp) || return 0
+# Echo `devicectl list devices` as JSON, or nothing (nonzero) on failure.
+# Always via a real temp file — devicectl corrupts JSON written to /dev/stdout.
+_devicectl_json() {
+  local tmp
+  tmp=$(mktemp) || return 1
   trap 'rm -f "$tmp"' RETURN
-  xcrun devicectl list devices --json-output "$tmp" >/dev/null 2>&1 \
-    || return 0
-  json=$(cat "$tmp")
+  xcrun devicectl list devices --json-output "$tmp" >/dev/null 2>&1 || return 1
+  cat "$tmp"
+}
+
+list_devices() {
+  local json
+  json=$(_devicectl_json) || return 0
   echo "$json" | jq -r '
     (.result.devices // [])[]
     | select(.connectionProperties.tunnelState == "connected")
@@ -287,7 +333,10 @@ list_devices() {
 select_destination() {
   local rows choice
   rows=$( { list_devices; list_simulators; } )
-  [[ -n "$rows" ]] || die "no destinations found"
+  [[ -n "$rows" ]] || die "no destinations found
+  - boot a simulator: open -a Simulator  (or 'xcrun simctl boot <name>')
+  - or connect an iPhone, unlock it, and trust this Mac
+  - run 'gleis doctor' to see what gleis can find"
 
   choice=$(echo "$rows" | fzf \
     --prompt="destination ❯ " \
@@ -333,7 +382,10 @@ ensure_local_files() {
 
   donor=$(find_donor_worktree || true)
   if [[ -z "$donor" || "$donor" == "$target" ]]; then
-    die "no other worktree has these files — regenerate them then re-run gleis"
+    die "no other worktree has the LOCAL_FILES listed in $CONFIG_FILE
+  these are gitignored files (secrets, keys, generated config) that gleis copies
+  between worktrees. No source worktree has them yet — recreate them in this
+  worktree the way you originally generated them, then re-run gleis."
   fi
 
   info "copying from $(basename "$donor")"
@@ -346,11 +398,47 @@ ensure_local_files() {
   done
 }
 
+# Per-destination primitives shared by the build flow. Each switches on kind
+# (sim|dev) so build_and_launch stays a single linear install→launch path.
+
+# Make the destination ready to receive an install. Sim: boot it and surface
+# Simulator.app. Device: nothing to do.
+prepare_destination() {
+  local kind="$1" udid="$2"
+  [[ "$kind" == "sim" ]] || return 0
+  info "ensuring simulator is booted…"
+  xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 \
+    || xcrun simctl boot "$udid" >/dev/null 2>&1 || true
+  open -a Simulator
+}
+
+install_app() {
+  local kind="$1" udid="$2" app_path="$3"
+  if [[ "$kind" == "sim" ]]; then
+    xcrun simctl install "$udid" "$app_path"
+  else
+    xcrun devicectl device install app --device "$udid" "$app_path"
+  fi
+}
+
+# Launch the installed app. Sim terminates any running copy first so the launch
+# is a clean start rather than a no-op on an already-running process.
+launch_app() {
+  local kind="$1" udid="$2"
+  if [[ "$kind" == "sim" ]]; then
+    xcrun simctl terminate "$udid" "$BUNDLE_ID" >/dev/null 2>&1 || true
+    xcrun simctl launch "$udid" "$BUNDLE_ID" >/dev/null
+  else
+    xcrun devicectl device process launch --device "$udid" "$BUNDLE_ID" >/dev/null
+  fi
+}
+
 build_and_launch() {
   local worktree="$1" kind="$2" udid="$3" display="$4" clean="$5" launch="$6" logs="$7"
-  local derived dest_arg lock_dir
-  derived="$CACHE_DIR/build/$(worktree_slug "$worktree")/DerivedData"
-  lock_dir="$CACHE_DIR/build/$(worktree_slug "$worktree")/.lock"
+  local slug derived dest_arg lock_dir
+  slug=$(worktree_slug "$worktree")
+  derived="$CACHE_DIR/build/$slug/DerivedData"
+  lock_dir="$CACHE_DIR/build/$slug/.lock"
 
   if [[ "$kind" == "sim" ]]; then
     dest_arg="platform=iOS Simulator,id=$udid"
@@ -367,6 +455,9 @@ build_and_launch() {
   # Per-worktree lock so two `gleis` runs on the same worktree don't stomp each
   # other's DerivedData. mkdir is atomic on all POSIX filesystems.
   mkdir -p "$(dirname "$lock_dir")"
+  # Record the owning worktree so `gleis prune` can later tell when this cache
+  # belongs to a worktree that no longer exists.
+  printf '%s\n' "$worktree" > "$CACHE_DIR/build/$slug/path"
   if ! mkdir "$lock_dir" 2>/dev/null; then
     die "another gleis build is already running for this worktree
   if you're sure nothing else is running, remove: $lock_dir"
@@ -400,7 +491,8 @@ build_and_launch() {
   )
 
   if command -v xcbeautify >/dev/null 2>&1; then
-    set -o pipefail
+    # pipefail is already on globally (set -euo pipefail at the top), so a
+    # failing xcodebuild still aborts the run even though its output is piped.
     "${xc_cmd[@]}" 2>&1 | xcbeautify --quiet
   else
     "${xc_cmd[@]}"
@@ -429,40 +521,24 @@ build_and_launch() {
     BUNDLE_ID="$actual_bundle_id"
   fi
 
-  if [[ "$kind" == "sim" ]]; then
-    info "ensuring simulator is booted…"
-    xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 \
-      || xcrun simctl boot "$udid" >/dev/null 2>&1 || true
-    open -a Simulator
-    info "installing $PRODUCT_NAME.app…"
-    xcrun simctl install "$udid" "$app_path"
-    xcrun simctl terminate "$udid" "$BUNDLE_ID" >/dev/null 2>&1 || true
-    if [[ "$launch" != "1" ]]; then
-      ok "installed on $display (skipped launch)"
-      return 0
-    fi
-    info "launching ${BUNDLE_ID}…"
-    xcrun simctl launch "$udid" "$BUNDLE_ID" >/dev/null
-    ok "running on $display"
-    if [[ "$logs" == "1" ]]; then
+  prepare_destination "$kind" "$udid"
+
+  info "installing ${PRODUCT_NAME}…"
+  install_app "$kind" "$udid" "$app_path"
+  if [[ "$launch" != "1" ]]; then
+    ok "installed on $display (skipped launch)"
+    return 0
+  fi
+
+  info "launching ${BUNDLE_ID}…"
+  launch_app "$kind" "$udid"
+  ok "running on $display"
+
+  if [[ "$logs" == "1" ]]; then
+    if [[ "$kind" == "sim" ]]; then
       stream_logs_sim "$udid"
-    fi
-  else
-    info "installing on device…"
-    xcrun devicectl device install app --device "$udid" "$app_path"
-    if [[ "$launch" != "1" ]]; then
-      ok "installed on $display (skipped launch)"
-      return 0
-    fi
-    if [[ "$logs" == "1" ]]; then
-      info "launching ${BUNDLE_ID}…"
-      xcrun devicectl device process launch --device "$udid" "$BUNDLE_ID" >/dev/null
-      ok "running on $display"
-      stream_logs_dev "$udid"
     else
-      info "launching ${BUNDLE_ID}…"
-      xcrun devicectl device process launch --device "$udid" "$BUNDLE_ID"
-      ok "running on $display"
+      stream_logs_dev "$udid"
     fi
   fi
 }
@@ -480,12 +556,8 @@ stream_logs_sim() {
 }
 
 device_hw_udid() {
-  local devicectl_id="$1" tmp json out
-  tmp=$(mktemp) || return 1
-  trap 'rm -f "$tmp"' RETURN
-  xcrun devicectl list devices --json-output "$tmp" >/dev/null 2>&1 \
-    || return 1
-  json=$(cat "$tmp")
+  local devicectl_id="$1" json out
+  json=$(_devicectl_json) || return 1
   out=$(echo "$json" | jq -r --arg id "$devicectl_id" '
     (.result.devices // [])[]
     | select(.identifier == $id)
@@ -553,7 +625,9 @@ _prompt() {
   else
     printf "  %s%s%s: " "$c_bold" "$prompt" "$c_reset" >&2
   fi
-  IFS= read -r reply </dev/tty
+  # No controlling tty (e.g. run non-interactively) → fall back to the default
+  # rather than aborting under `set -e` (2>/dev/null hides the open failure).
+  IFS= read -r reply </dev/tty 2>/dev/null || reply=""
   echo "${reply:-$default}"
 }
 
@@ -562,7 +636,8 @@ _confirm() {
   local prompt="$1" default="${2:-n}" reply suffix
   suffix=$([[ "$default" == "y" ]] && echo "[Y/n]" || echo "[y/N]")
   printf "  %s%s%s %s: " "$c_bold" "$prompt" "$c_reset" "$suffix" >&2
-  IFS= read -r reply </dev/tty
+  # No controlling tty → use the default (which for destructive prompts is "n").
+  IFS= read -r reply </dev/tty 2>/dev/null || reply=""
   reply="${reply:-$default}"
   [[ "$reply" =~ ^[Yy] ]]
 }
@@ -757,6 +832,87 @@ init() {
   printf "    4. Build & launch:         gleis\n\n"
 }
 
+# ─── prune ───────────────────────────────────────────────────────────────────
+
+# Reclaim build-cache disk. Each build records its source worktree in a `path`
+# marker (see build_and_launch); a cache dir is "stale" when that worktree no
+# longer exists. `gleis prune --all` clears the whole build cache instead.
+# Dirs with an active .lock (a build in progress) are always skipped, and
+# pre-marker caches are kept unless --all is given.
+prune() {
+  local all=0 a
+  for a in "$@"; do [[ "$a" == "--all" ]] && all=1; done
+
+  local build_root="$CACHE_DIR/build"
+  if [[ ! -d "$build_root" ]]; then
+    info "no build cache yet — nothing to prune"
+    return 0
+  fi
+
+  local victims=()
+  local d marker wt size kept_live=0 kept_markerless=0 kept_locked=0
+  for d in "$build_root"/*/; do
+    [[ -d "$d" ]] || continue          # literal glob when build/ is empty
+    d="${d%/}"
+    if [[ -d "$d/.lock" ]]; then
+      kept_locked=$((kept_locked + 1)); continue
+    fi
+    if (( all )); then
+      victims+=("$d"); continue
+    fi
+    marker="$d/path"
+    if [[ -f "$marker" ]]; then
+      wt=$(cat "$marker")
+      if [[ -d "$wt" ]]; then kept_live=$((kept_live + 1)); else victims+=("$d"); fi
+    else
+      kept_markerless=$((kept_markerless + 1))
+    fi
+  done
+
+  if (( ${#victims[@]} == 0 )); then
+    if (( all )); then
+      info "build cache is empty — nothing to prune"
+    else
+      ok "no stale caches — nothing to prune"
+      (( kept_live > 0 ))       && info "$kept_live cache(s) belong to existing worktrees"
+      (( kept_markerless > 0 )) && info "$kept_markerless cache(s) predate the origin marker — clear all with: gleis prune --all"
+      (( kept_locked > 0 ))     && info "$kept_locked cache(s) skipped (build in progress)"
+    fi
+    return 0
+  fi
+
+  if (( all )); then
+    warn "this will delete the ENTIRE build cache ($(du -sh "$build_root" 2>/dev/null | awk '{print $1}')):"
+  else
+    warn "these build caches have no matching worktree:"
+  fi
+  for d in "${victims[@]}"; do
+    size=$(du -sh "$d" 2>/dev/null | awk '{print $1}')
+    if [[ -f "$d/path" ]]; then
+      printf "    %s  %s  ← %s\n" "$(basename "$d")" "${size:-?}" "$(cat "$d/path")"
+    else
+      printf "    %s  %s\n" "$(basename "$d")" "${size:-?}"
+    fi
+  done
+  (( all == 0 && kept_markerless > 0 )) && info "$kept_markerless markerless cache(s) kept — clear them too with: gleis prune --all"
+  (( kept_locked > 0 )) && info "$kept_locked cache(s) skipped (build in progress)"
+
+  if ! _confirm "Delete the above?" "n"; then
+    info "nothing deleted"
+    return 0
+  fi
+
+  local before after freed
+  before=$(du -sk "$build_root" 2>/dev/null | awk '{print $1}')
+  for d in "${victims[@]}"; do
+    rm -rf "$d"
+    ok "removed $(basename "$d")"
+  done
+  after=$(du -sk "$build_root" 2>/dev/null | awk '{print $1}')
+  freed=$(( ( ${before:-0} - ${after:-0} ) / 1024 ))
+  ok "reclaimed ~${freed} MB"
+}
+
 # ─── doctor ──────────────────────────────────────────────────────────────────
 
 # Status row helpers. Each prints one diagnostic line plus, on failure, a "→"
@@ -845,9 +1001,14 @@ doctor() {
   _section "cache"
   if [[ -d "$CACHE_DIR" ]]; then
     if [[ -w "$CACHE_DIR" ]]; then
-      local size
+      local size build_size
       size=$(du -sh "$CACHE_DIR" 2>/dev/null | awk '{print $1}')
       _row_ok "$CACHE_DIR (${size:-unknown size})"
+      if [[ -d "$CACHE_DIR/build" ]]; then
+        build_size=$(du -sh "$CACHE_DIR/build" 2>/dev/null | awk '{print $1}')
+        _row_ok "build cache: ${build_size:-unknown size}"
+        _row_hint "reclaim space from deleted worktrees with: gleis prune"
+      fi
     else
       _row_err "$CACHE_DIR exists but is not writable"
       _row_hint "chmod u+w $CACHE_DIR"
@@ -908,35 +1069,72 @@ doctor() {
     fi
   fi
 
-  _section "destinations"
-  local sim_count dev_count
-  if command -v xcrun >/dev/null 2>&1; then
-    sim_count=$(xcrun simctl list devices --json available 2>/dev/null \
-      | jq '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.isAvailable == true)] | length' 2>/dev/null \
-      || echo 0)
-    _row_ok "$sim_count iOS simulator(s) available"
+  # Informational from here down — these never set fail.
+  _section "worktrees"
+  if [[ -z "$repo" ]]; then
+    _row_warn "not in a repo — skipping"
+  elif [[ -z "${PROJECT:-}" ]]; then
+    _row_warn "no usable config — can't tell which worktrees match"
+  else
+    local wt_rows wt_count
+    wt_rows=$(_worktrees_with_project "$repo" "$PROJECT" 2>/dev/null || true)
+    if [[ -n "$wt_rows" ]]; then
+      wt_count=$(printf '%s\n' "$wt_rows" | grep -c .)
+      _row_ok "$wt_count worktree(s) contain $PROJECT"
+      printf '%s\n' "$wt_rows" | awk -F'\t' '{printf "      %s  (%s)\n", $2, $1}'
+    else
+      _row_warn "no worktrees contain $PROJECT"
+      _row_hint "add one with: git worktree add <path> <branch>"
+    fi
+  fi
 
-    local dtmp
-    dtmp=$(mktemp) || dtmp=""
-    if [[ -n "$dtmp" ]] && xcrun devicectl list devices --json-output "$dtmp" >/dev/null 2>&1; then
-      dev_count=$(jq '[.result.devices // [] | .[] | select(.connectionProperties.tunnelState == "connected") | select((.hardwareProperties.platform // "") == "iOS")] | length' < "$dtmp" 2>/dev/null || echo 0)
-      if [[ "$dev_count" -gt 0 ]]; then
+  _section "last run"
+  if [[ -z "$repo" ]]; then
+    _row_warn "not in a repo — skipping"
+  else
+    local sf last_line last_wt last_disp
+    sf=$(state_file_for_repo "$repo")
+    if [[ -f "$sf" ]]; then
+      # Read in a subshell so LAST_* don't leak into doctor's scope.
+      last_line=$( # shellcheck disable=SC1090
+        source "$sf" 2>/dev/null; printf '%s\t%s' "${LAST_WORKTREE:-}" "${LAST_DISPLAY:-}")
+      IFS=$'\t' read -r last_wt last_disp <<<"$last_line"
+      _row_ok "worktree:    $(basename "${last_wt:-?}")"
+      _row_ok "destination: ${last_disp:-?}"
+      _row_hint "repeat it with: gleis --last"
+    else
+      _row_ok "none yet — run 'gleis' once to remember a worktree + destination"
+    fi
+  fi
+
+  _section "destinations"
+  local sim_count booted_count dev_count sim_json dev_json
+  if command -v xcrun >/dev/null 2>&1; then
+    sim_json=$(xcrun simctl list devices --json available 2>/dev/null || true)
+    sim_count=$(printf '%s' "$sim_json" | jq '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.isAvailable == true)] | length' 2>/dev/null || echo 0)
+    booted_count=$(printf '%s' "$sim_json" | jq '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.isAvailable == true) | select(.state == "Booted")] | length' 2>/dev/null || echo 0)
+    _row_ok "$sim_count iOS simulator(s) available"
+    if [[ "${booted_count:-0}" -gt 0 ]]; then
+      _row_ok "$booted_count already booted (fastest to build to)"
+    fi
+
+    if dev_json=$(_devicectl_json); then
+      dev_count=$(printf '%s' "$dev_json" | jq '[.result.devices // [] | .[] | select(.connectionProperties.tunnelState == "connected") | select((.hardwareProperties.platform // "") == "iOS")] | length' 2>/dev/null || echo 0)
+      if [[ "${dev_count:-0}" -gt 0 ]]; then
         _row_ok "$dev_count physical device(s) connected"
-        jq -r '
+        printf '%s' "$dev_json" | jq -r '
           (.result.devices // [])[]
           | select(.connectionProperties.tunnelState == "connected")
           | select((.hardwareProperties.platform // "") == "iOS")
           | "      — \(.deviceProperties.name) (iOS \(.deviceProperties.osVersionNumber), \(.connectionProperties.transportType))"
-        ' < "$dtmp" 2>/dev/null
+        ' 2>/dev/null
       else
         _row_warn "no physical iOS devices connected"
         _row_hint "plug in an iPhone, unlock it, and trust this Mac"
         _row_hint "ensure Developer Mode is on (Settings → Privacy & Security → Developer Mode)"
       fi
-      rm -f "$dtmp"
     else
       _row_warn "devicectl unavailable — can't enumerate physical devices"
-      [[ -n "$dtmp" ]] && rm -f "$dtmp"
     fi
   else
     _row_err "xcrun not available; cannot probe destinations"
@@ -954,7 +1152,7 @@ doctor() {
 # ─── main ────────────────────────────────────────────────────────────────────
 
 usage() {
-  sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
@@ -1018,6 +1216,11 @@ fi
 
 if [[ -n "${GLEIS_DOCTOR_MODE:-}" ]]; then
   doctor
+  exit $?
+fi
+
+if [[ -n "${GLEIS_PRUNE_MODE:-}" ]]; then
+  prune "$@"
   exit $?
 fi
 
