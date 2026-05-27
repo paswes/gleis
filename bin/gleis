@@ -87,11 +87,17 @@ for arg in "$@"; do
       # who haven't installed everything yet.
       GLEIS_INIT_MODE=1
       ;;
+    prune)
+      # `prune` reclaims build-cache disk. It only touches the cache, so it
+      # bypasses the build-tool dep-check and never loads a project config.
+      GLEIS_PRUNE_MODE=1
+      ;;
   esac
 done
 
-# Required runtime tools — checked here for normal commands; doctor and init bypass this.
-if [[ -z "${GLEIS_DOCTOR_MODE:-}" && -z "${GLEIS_INIT_MODE:-}" ]]; then
+# Required runtime tools — checked here for normal commands. doctor, init, and
+# prune bypass this (they work without a full build toolchain).
+if [[ -z "${GLEIS_DOCTOR_MODE:-}" && -z "${GLEIS_INIT_MODE:-}" && -z "${GLEIS_PRUNE_MODE:-}" ]]; then
   require fzf jq xcodebuild xcrun
 fi
 
@@ -443,6 +449,9 @@ build_and_launch() {
   # Per-worktree lock so two `gleis` runs on the same worktree don't stomp each
   # other's DerivedData. mkdir is atomic on all POSIX filesystems.
   mkdir -p "$(dirname "$lock_dir")"
+  # Record the owning worktree so `gleis prune` can later tell when this cache
+  # belongs to a worktree that no longer exists.
+  printf '%s\n' "$worktree" > "$CACHE_DIR/build/$slug/path"
   if ! mkdir "$lock_dir" 2>/dev/null; then
     die "another gleis build is already running for this worktree
   if you're sure nothing else is running, remove: $lock_dir"
@@ -610,7 +619,9 @@ _prompt() {
   else
     printf "  %s%s%s: " "$c_bold" "$prompt" "$c_reset" >&2
   fi
-  IFS= read -r reply </dev/tty
+  # No controlling tty (e.g. run non-interactively) → fall back to the default
+  # rather than aborting under `set -e` (2>/dev/null hides the open failure).
+  IFS= read -r reply </dev/tty 2>/dev/null || reply=""
   echo "${reply:-$default}"
 }
 
@@ -619,7 +630,8 @@ _confirm() {
   local prompt="$1" default="${2:-n}" reply suffix
   suffix=$([[ "$default" == "y" ]] && echo "[Y/n]" || echo "[y/N]")
   printf "  %s%s%s %s: " "$c_bold" "$prompt" "$c_reset" "$suffix" >&2
-  IFS= read -r reply </dev/tty
+  # No controlling tty → use the default (which for destructive prompts is "n").
+  IFS= read -r reply </dev/tty 2>/dev/null || reply=""
   reply="${reply:-$default}"
   [[ "$reply" =~ ^[Yy] ]]
 }
@@ -812,6 +824,87 @@ init() {
   printf "    2. Verify setup:           gleis doctor\n"
   printf "    3. Commit when ready:      git add .gleis.conf && git commit -m \"Add gleis config\"\n"
   printf "    4. Build & launch:         gleis\n\n"
+}
+
+# ─── prune ───────────────────────────────────────────────────────────────────
+
+# Reclaim build-cache disk. Each build records its source worktree in a `path`
+# marker (see build_and_launch); a cache dir is "stale" when that worktree no
+# longer exists. `gleis prune --all` clears the whole build cache instead.
+# Dirs with an active .lock (a build in progress) are always skipped, and
+# pre-marker caches are kept unless --all is given.
+prune() {
+  local all=0 a
+  for a in "$@"; do [[ "$a" == "--all" ]] && all=1; done
+
+  local build_root="$CACHE_DIR/build"
+  if [[ ! -d "$build_root" ]]; then
+    info "no build cache yet — nothing to prune"
+    return 0
+  fi
+
+  local victims=()
+  local d marker wt size kept_live=0 kept_markerless=0 kept_locked=0
+  for d in "$build_root"/*/; do
+    [[ -d "$d" ]] || continue          # literal glob when build/ is empty
+    d="${d%/}"
+    if [[ -d "$d/.lock" ]]; then
+      kept_locked=$((kept_locked + 1)); continue
+    fi
+    if (( all )); then
+      victims+=("$d"); continue
+    fi
+    marker="$d/path"
+    if [[ -f "$marker" ]]; then
+      wt=$(cat "$marker")
+      if [[ -d "$wt" ]]; then kept_live=$((kept_live + 1)); else victims+=("$d"); fi
+    else
+      kept_markerless=$((kept_markerless + 1))
+    fi
+  done
+
+  if (( ${#victims[@]} == 0 )); then
+    if (( all )); then
+      info "build cache is empty — nothing to prune"
+    else
+      ok "no stale caches — nothing to prune"
+      (( kept_live > 0 ))       && info "$kept_live cache(s) belong to existing worktrees"
+      (( kept_markerless > 0 )) && info "$kept_markerless cache(s) predate the origin marker — clear all with: gleis prune --all"
+      (( kept_locked > 0 ))     && info "$kept_locked cache(s) skipped (build in progress)"
+    fi
+    return 0
+  fi
+
+  if (( all )); then
+    warn "this will delete the ENTIRE build cache ($(du -sh "$build_root" 2>/dev/null | awk '{print $1}')):"
+  else
+    warn "these build caches have no matching worktree:"
+  fi
+  for d in "${victims[@]}"; do
+    size=$(du -sh "$d" 2>/dev/null | awk '{print $1}')
+    if [[ -f "$d/path" ]]; then
+      printf "    %s  %s  ← %s\n" "$(basename "$d")" "${size:-?}" "$(cat "$d/path")"
+    else
+      printf "    %s  %s\n" "$(basename "$d")" "${size:-?}"
+    fi
+  done
+  (( all == 0 && kept_markerless > 0 )) && info "$kept_markerless markerless cache(s) kept — clear them too with: gleis prune --all"
+  (( kept_locked > 0 )) && info "$kept_locked cache(s) skipped (build in progress)"
+
+  if ! _confirm "Delete the above?" "n"; then
+    info "nothing deleted"
+    return 0
+  fi
+
+  local before after freed
+  before=$(du -sk "$build_root" 2>/dev/null | awk '{print $1}')
+  for d in "${victims[@]}"; do
+    rm -rf "$d"
+    ok "removed $(basename "$d")"
+  done
+  after=$(du -sk "$build_root" 2>/dev/null | awk '{print $1}')
+  freed=$(( ( ${before:-0} - ${after:-0} ) / 1024 ))
+  ok "reclaimed ~${freed} MB"
 }
 
 # ─── doctor ──────────────────────────────────────────────────────────────────
@@ -1117,6 +1210,11 @@ fi
 
 if [[ -n "${GLEIS_DOCTOR_MODE:-}" ]]; then
   doctor
+  exit $?
+fi
+
+if [[ -n "${GLEIS_PRUNE_MODE:-}" ]]; then
+  prune "$@"
   exit $?
 fi
 
