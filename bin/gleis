@@ -1,0 +1,1024 @@
+#!/usr/bin/env bash
+#
+# gleis — pick a git worktree + iOS destination, build, install, launch.
+#
+# Usage:
+#   gleis                         interactive: pick worktree, then destination
+#   gleis --last                  rebuild last worktree on last destination
+#   gleis -d, --destination       keep last worktree, pick a new destination
+#   gleis -w, --worktree          keep last destination, pick a new worktree
+#   gleis <branch-substring>      preselect worktree by branch fuzzy-match
+#   gleis -l, --logs              stream app logs after launch (Ctrl-C to stop)
+#   gleis --no-launch             build + install only, don't launch
+#   gleis --clean                 wipe this worktree's DerivedData first
+#   gleis init                    create .gleis.conf for the current project
+#   gleis doctor                  diagnose your gleis setup
+#   gleis --version               print version
+#
+# Requires: fzf, jq, xcodebuild, xcrun  (xcbeautify optional, used if present)
+#
+# Configuration:
+#   gleis reads project config from the first file found in:
+#     1. $GLEIS_CONFIG (if set)
+#     2. <repo-root>/.gleis.conf
+#     3. ~/.config/gleis/<repo-name>.conf
+#     4. ~/.config/gleis/default.conf
+#
+#   Config files are sourced as shell and must define:
+#     SCHEME      — Xcode scheme name (e.g. "MyApp")
+#     PROJECT     — Xcode project or workspace, relative to repo root.
+#                   Use .xcodeproj or .xcworkspace; subdirs OK
+#                   (e.g. "MyApp.xcodeproj" or "ios/MyApp.xcworkspace")
+#     BUNDLE_ID   — app bundle identifier (e.g. "com.example.myapp")
+#   Optional:
+#     CONFIG       — Debug | Release | <custom> (default: Debug)
+#     PRODUCT_NAME — the .app filename if it differs from SCHEME
+#                    (default: same as SCHEME)
+#     LOCAL_FILES  — array of gitignored files to auto-copy across worktrees
+
+readonly GLEIS_VERSION="1.0.0"
+
+set -euo pipefail
+
+readonly CACHE_DIR="${HOME}/Library/Caches/gleis"
+readonly STATE_DIR="${CACHE_DIR}/state"
+mkdir -p "$STATE_DIR"
+
+# ─── ui helpers ──────────────────────────────────────────────────────────────
+
+c_reset=$'\033[0m'; c_bold=$'\033[1m'
+c_blue=$'\033[1;34m'; c_green=$'\033[1;32m'; c_red=$'\033[1;31m'; c_yellow=$'\033[1;33m'
+
+die()  { printf "%serror:%s %s\n" "$c_red" "$c_reset" "$*" >&2; exit 1; }
+info() { printf "%s▸%s %s\n" "$c_blue" "$c_reset" "$*"; }
+ok()   { printf "%s✓%s %s\n" "$c_green" "$c_reset" "$*"; }
+warn() { printf "%s!%s %s\n" "$c_yellow" "$c_reset" "$*"; }
+
+require() {
+  local missing=()
+  for cmd in "$@"; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+  if (( ${#missing[@]} )); then
+    die "missing: ${missing[*]} — install with: brew install ${missing[*]}"
+  fi
+}
+
+# Early-exit for --help / --version so they work without dependencies
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    --version)
+      echo "gleis $GLEIS_VERSION"
+      exit 0
+      ;;
+    doctor)
+      # `doctor` runs without requiring deps — it diagnoses what's missing.
+      # Implementation is deferred until after helper functions are defined,
+      # so we just record intent here and dispatch at the end.
+      GLEIS_DOCTOR_MODE=1
+      ;;
+    init)
+      # `init` walks the user through creating a .gleis.conf for the current
+      # project. Like doctor, it bypasses the dep-check so it can guide users
+      # who haven't installed everything yet.
+      GLEIS_INIT_MODE=1
+      ;;
+  esac
+done
+
+# Required runtime tools — checked here for normal commands; doctor and init bypass this.
+if [[ -z "${GLEIS_DOCTOR_MODE:-}" && -z "${GLEIS_INIT_MODE:-}" ]]; then
+  require fzf jq xcodebuild xcrun
+fi
+
+# ─── config loading ──────────────────────────────────────────────────────────
+
+repo_root() {
+  # Prefer the git repo we're currently inside; fall back to $GLEIS_REPO if set
+  # and we're not in a repo. This way `GLEIS_REPO=/path/to/X` set in shell config
+  # doesn't accidentally hijack `gleis` runs in other projects.
+  local found
+  found=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)
+  if [[ -n "$found" ]]; then
+    echo "$found"
+    return
+  fi
+  if [[ -n "${GLEIS_REPO:-}" ]]; then
+    [[ -d "$GLEIS_REPO/.git" || -e "$GLEIS_REPO/.git" ]] \
+      || die "GLEIS_REPO is set to '$GLEIS_REPO' but that's not a git repo"
+    echo "$GLEIS_REPO"
+    return
+  fi
+  die "not in a git repo — cd into a project, or set GLEIS_REPO=/path/to/project"
+}
+
+# Per-project state file: one cache slot per repo, keyed by repo name
+state_file_for_repo() {
+  local repo="$1"
+  printf '%s/%s' "$STATE_DIR" "$(basename "$repo")"
+}
+
+load_config() {
+  local repo="$1" repo_name candidates=() chosen=""
+  repo_name=$(basename "$repo")
+
+  if [[ -n "${GLEIS_CONFIG:-}" ]]; then
+    candidates+=("$GLEIS_CONFIG")
+  fi
+  candidates+=(
+    "$repo/.gleis.conf"
+    "${HOME}/.config/gleis/${repo_name}.conf"
+    "${HOME}/.config/gleis/default.conf"
+  )
+
+  for f in "${candidates[@]}"; do
+    if [[ -f "$f" ]]; then chosen="$f"; break; fi
+  done
+
+  if [[ -z "$chosen" ]]; then
+    die "no config found. Looked in:
+    $(printf '    %s\n' "${candidates[@]}")
+  Create one with these required vars:
+    SCHEME=\"YourScheme\"
+    PROJECT=\"YourProject.xcodeproj\"
+    BUNDLE_ID=\"com.example.app\""
+  fi
+
+  # Defaults applied BEFORE sourcing so the config can override.
+  CONFIG="Debug"
+  PRODUCT_NAME=""
+  LOCAL_FILES=()
+
+  # shellcheck disable=SC1090
+  source "$chosen"
+  CONFIG_FILE="$chosen"
+
+  # Required fields
+  [[ -n "${SCHEME:-}" ]]    || die "config $chosen: missing SCHEME"
+  [[ -n "${PROJECT:-}" ]]   || die "config $chosen: missing PROJECT"
+  [[ -n "${BUNDLE_ID:-}" ]] || die "config $chosen: missing BUNDLE_ID"
+
+  # Derive PRODUCT_NAME from SCHEME if not set
+  [[ -n "$PRODUCT_NAME" ]] || PRODUCT_NAME="$SCHEME"
+
+  # Detect project vs workspace from extension. Used for xcodebuild flag.
+  case "$PROJECT" in
+    *.xcworkspace) PROJECT_FLAG="-workspace" ;;
+    *.xcodeproj)   PROJECT_FLAG="-project"   ;;
+    *) die "config $chosen: PROJECT must end in .xcodeproj or .xcworkspace, got: $PROJECT" ;;
+  esac
+
+  # Verify the project exists somewhere — at minimum in the main worktree.
+  # (Other worktrees may share the same path or be missing files, that's handled
+  #  later per-worktree.)
+  if ! [[ -e "$repo/$PROJECT" ]]; then
+    die "config $chosen: PROJECT '$PROJECT' not found at $repo/$PROJECT
+  - check the filename
+  - if it's in a subdirectory, set PROJECT=\"path/to/$PROJECT\""
+  fi
+
+  # Verify the scheme is listed by xcodebuild. Catches typos before a slow build.
+  local schemes
+  schemes=$(xcodebuild $PROJECT_FLAG "$repo/$PROJECT" -list 2>/dev/null \
+            | awk '/Schemes:/{ found=1; next } found && NF { sub(/^[ \t]+/, ""); print }')
+  if ! echo "$schemes" | grep -qFx "$SCHEME"; then
+    # shellcheck disable=SC2001
+    die "config $chosen: SCHEME '$SCHEME' not found in $PROJECT
+  Available schemes:
+$(echo "$schemes" | sed 's/^/    /')"
+  fi
+}
+
+# ─── worktrees ───────────────────────────────────────────────────────────────
+
+# Output: <path>\t<branch-or-HEAD>  for each worktree containing $PROJECT
+list_worktrees() {
+  local path branch repo
+  repo=$(repo_root)
+  git -C "$repo" worktree list --porcelain | awk '
+    /^worktree / { p=substr($0,10); b="(detached)"; next }
+    /^branch /   { b=substr($0,8); sub(/^refs\/heads\//, "", b); next }
+    /^$/         { if (p) print p "\t" b; p="" }
+    END          { if (p) print p "\t" b }
+  ' | while IFS=$'\t' read -r path branch; do
+    [[ -e "$path/$PROJECT" ]] && printf '%s\t%s\n' "$path" "$branch"
+  done
+}
+
+# Echoes selected worktree path
+select_worktree() {
+  local preselect="${1:-}" rows choice
+
+  rows=$(list_worktrees)
+  [[ -n "$rows" ]] || die "no worktrees with $PROJECT found"
+
+  if [[ -n "$preselect" ]]; then
+    choice=$(echo "$rows" | awk -F'\t' -v q="$preselect" '
+      tolower($2) ~ tolower(q) || tolower($1) ~ tolower(q)
+    ' | head -1)
+    [[ -n "$choice" ]] || die "no worktree matches '$preselect'"
+  else
+    choice=$(echo "$rows" | fzf \
+      --prompt="worktree ❯ " \
+      --delimiter=$'\t' \
+      --with-nth=2,1 \
+      --header="select a worktree" \
+      --height=40% --reverse --no-multi) \
+      || die "no worktree selected"
+  fi
+  echo "$choice" | awk -F'\t' '{print $1}'
+}
+
+# ─── destinations ────────────────────────────────────────────────────────────
+
+# Each row: <kind>\t<udid>\t<display>
+#   kind: sim | dev
+list_simulators() {
+  xcrun simctl list devices --json available 2>/dev/null | jq -r '
+    .devices
+    | to_entries[]
+    | select(.key | test("iOS"))
+    | (.key
+        | sub("com.apple.CoreSimulator.SimRuntime.iOS-"; "iOS ")
+        | gsub("-"; ".")
+      ) as $rt
+    | .value[]
+    | select(.isAvailable == true)
+    | [
+        (if .state == "Booted" then "0" else "1" end),
+        .udid,
+        .name,
+        $rt,
+        .state
+      ] | @tsv
+  ' | sort | awk -F'\t' '{
+      mark = ($5 == "Booted") ? "● booted" : "○"
+      printf "sim\t%s\t%s — %s  %s\n", $2, $3, $4, mark
+    }'
+}
+
+list_devices() {
+  local tmp json
+  tmp=$(mktemp) || return 0
+  trap 'rm -f "$tmp"' RETURN
+  xcrun devicectl list devices --json-output "$tmp" >/dev/null 2>&1 \
+    || return 0
+  json=$(cat "$tmp")
+  echo "$json" | jq -r '
+    (.result.devices // [])[]
+    | select(.connectionProperties.tunnelState == "connected")
+    | select((.hardwareProperties.platform // "") == "iOS")
+    | [
+        .identifier,
+        .deviceProperties.name // "Unknown",
+        .deviceProperties.osVersionNumber // "?",
+        .connectionProperties.transportType // "?"
+      ] | @tsv
+  ' 2>/dev/null | awk -F'\t' '{
+      printf "dev\t%s\t%s — iOS %s  ◆ device (%s)\n", $1, $2, $3, $4
+    }'
+}
+
+# Echoes selected destination row: <kind>\t<udid>\t<display>
+select_destination() {
+  local rows choice
+  rows=$( { list_devices; list_simulators; } )
+  [[ -n "$rows" ]] || die "no destinations found"
+
+  choice=$(echo "$rows" | fzf \
+    --prompt="destination ❯ " \
+    --delimiter=$'\t' \
+    --with-nth=3 \
+    --header="select a destination (devices first, booted sims next)" \
+    --height=50% --reverse --no-multi) \
+    || die "no destination selected"
+  echo "$choice"
+}
+
+# ─── build + launch ──────────────────────────────────────────────────────────
+
+worktree_slug() {
+  printf "%s" "$1" | shasum -a 1 | cut -c1-10
+}
+
+find_donor_worktree() {
+  local worktree branch all_present f
+  while IFS=$'\t' read -r worktree branch; do
+    all_present=1
+    for f in "${LOCAL_FILES[@]}"; do
+      [[ -e "$worktree/$f" ]] || { all_present=0; break; }
+    done
+    if (( all_present )); then
+      echo "$worktree"
+      return 0
+    fi
+  done < <(list_worktrees)
+}
+
+ensure_local_files() {
+  local target="$1" missing=() f donor src dst
+  (( ${#LOCAL_FILES[@]} == 0 )) && return 0
+
+  for f in "${LOCAL_FILES[@]}"; do
+    [[ -e "$target/$f" ]] || missing+=("$f")
+  done
+  (( ${#missing[@]} == 0 )) && return 0
+
+  warn "missing local files in this worktree:"
+  for f in "${missing[@]}"; do printf "    %s\n" "$f"; done
+
+  donor=$(find_donor_worktree || true)
+  if [[ -z "$donor" || "$donor" == "$target" ]]; then
+    die "no other worktree has these files — regenerate them then re-run gleis"
+  fi
+
+  info "copying from $(basename "$donor")"
+  for f in "${missing[@]}"; do
+    src="$donor/$f"; dst="$target/$f"
+    [[ -e "$src" ]] || die "missing in donor too: $src"
+    mkdir -p "$(dirname "$dst")"
+    cp -p "$src" "$dst"
+    ok "  $f"
+  done
+}
+
+build_and_launch() {
+  local worktree="$1" kind="$2" udid="$3" display="$4" clean="$5" launch="$6" logs="$7"
+  local derived dest_arg lock_dir
+  derived="$CACHE_DIR/build/$(worktree_slug "$worktree")/DerivedData"
+  lock_dir="$CACHE_DIR/build/$(worktree_slug "$worktree")/.lock"
+
+  if [[ "$kind" == "sim" ]]; then
+    dest_arg="platform=iOS Simulator,id=$udid"
+  else
+    dest_arg="platform=iOS,id=$udid"
+  fi
+
+  printf "\n%s%s%s\n" "$c_bold" "─── $(basename "$worktree") → $display ───" "$c_reset"
+  info "worktree:    $worktree"
+  info "destination: $dest_arg"
+  info "derived:     $derived"
+  info "config:      $CONFIG_FILE"
+
+  # Per-worktree lock so two `gleis` runs on the same worktree don't stomp each
+  # other's DerivedData. mkdir is atomic on all POSIX filesystems.
+  mkdir -p "$(dirname "$lock_dir")"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    die "another gleis build is already running for this worktree
+  if you're sure nothing else is running, remove: $lock_dir"
+  fi
+  # Release the lock on any exit path, including ctrl-C.
+  # Bake lock_dir's value into the trap string NOW, so the trap doesn't
+  # reference $lock_dir after the function returns (which would crash
+  # under `set -u`).
+  # shellcheck disable=SC2064  # early expansion is intentional
+  trap "$(printf 'rmdir %q 2>/dev/null || true' "$lock_dir")" EXIT INT TERM
+
+  cd "$worktree"
+
+  ensure_local_files "$worktree"
+
+  if [[ "$clean" == "1" ]]; then
+    warn "wiping $derived"
+    rm -rf "$derived"
+  fi
+
+  info "building…"
+  local xc_cmd=(
+    xcodebuild
+    "$PROJECT_FLAG" "$PROJECT"
+    -scheme "$SCHEME"
+    -configuration "$CONFIG"
+    -destination "$dest_arg"
+    -derivedDataPath "$derived"
+    -quiet
+    build
+  )
+
+  if command -v xcbeautify >/dev/null 2>&1; then
+    set -o pipefail
+    "${xc_cmd[@]}" 2>&1 | xcbeautify --quiet
+  else
+    "${xc_cmd[@]}"
+  fi
+  ok "build succeeded"
+
+  local app_path products_subdir
+  if [[ "$kind" == "sim" ]]; then
+    products_subdir="${CONFIG}-iphonesimulator"
+  else
+    products_subdir="${CONFIG}-iphoneos"
+  fi
+  app_path="$derived/Build/Products/$products_subdir/$PRODUCT_NAME.app"
+  [[ -d "$app_path" ]] || die "couldn't locate built $PRODUCT_NAME.app at $app_path
+  - if your app's .app name differs from the scheme name, set PRODUCT_NAME in $CONFIG_FILE"
+
+  # Sanity-check: the built app's actual bundle ID should match config.
+  # If it doesn't, install succeeds but launch fails confusingly later.
+  local actual_bundle_id
+  if actual_bundle_id=$(defaults read "$app_path/Info" CFBundleIdentifier 2>/dev/null) \
+     && [[ -n "$actual_bundle_id" && "$actual_bundle_id" != "$BUNDLE_ID" ]]; then
+    warn "BUNDLE_ID mismatch:"
+    printf "    config says: %s\n" "$BUNDLE_ID"
+    printf "    built app:   %s\n" "$actual_bundle_id"
+    warn "update BUNDLE_ID in $CONFIG_FILE; using built value for this run"
+    BUNDLE_ID="$actual_bundle_id"
+  fi
+
+  if [[ "$kind" == "sim" ]]; then
+    info "ensuring simulator is booted…"
+    xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 \
+      || xcrun simctl boot "$udid" >/dev/null 2>&1 || true
+    open -a Simulator
+    info "installing $PRODUCT_NAME.app…"
+    xcrun simctl install "$udid" "$app_path"
+    xcrun simctl terminate "$udid" "$BUNDLE_ID" >/dev/null 2>&1 || true
+    if [[ "$launch" != "1" ]]; then
+      ok "installed on $display (skipped launch)"
+      return 0
+    fi
+    info "launching ${BUNDLE_ID}…"
+    xcrun simctl launch "$udid" "$BUNDLE_ID" >/dev/null
+    ok "running on $display"
+    if [[ "$logs" == "1" ]]; then
+      stream_logs_sim "$udid"
+    fi
+  else
+    info "installing on device…"
+    xcrun devicectl device install app --device "$udid" "$app_path"
+    if [[ "$launch" != "1" ]]; then
+      ok "installed on $display (skipped launch)"
+      return 0
+    fi
+    if [[ "$logs" == "1" ]]; then
+      info "launching ${BUNDLE_ID}…"
+      xcrun devicectl device process launch --device "$udid" "$BUNDLE_ID" >/dev/null
+      ok "running on $display"
+      stream_logs_dev "$udid"
+    else
+      info "launching ${BUNDLE_ID}…"
+      xcrun devicectl device process launch --device "$udid" "$BUNDLE_ID"
+      ok "running on $display"
+    fi
+  fi
+}
+
+stream_logs_sim() {
+  local udid="$1"
+  printf "%s── logs ──%s\n" "$c_bold" "$c_reset"
+  ok "streaming logs from $PRODUCT_NAME (Ctrl-C to stop)"
+  trap 'echo; warn "stopped streaming (app keeps running on simulator)"; exit 0' INT
+  xcrun simctl spawn "$udid" log stream \
+    --style compact \
+    --process "$PRODUCT_NAME" \
+    --level debug || true
+  trap - INT
+}
+
+device_hw_udid() {
+  local devicectl_id="$1" tmp json out
+  tmp=$(mktemp) || return 1
+  trap 'rm -f "$tmp"' RETURN
+  xcrun devicectl list devices --json-output "$tmp" >/dev/null 2>&1 \
+    || return 1
+  json=$(cat "$tmp")
+  out=$(echo "$json" | jq -r --arg id "$devicectl_id" '
+    (.result.devices // [])[]
+    | select(.identifier == $id)
+    | .hardwareProperties.udid
+  ' 2>/dev/null)
+  [[ -n "$out" && "$out" != "null" ]] && echo "$out"
+}
+
+stream_logs_dev() {
+  local devicectl_id="$1" hw_udid
+  printf "%s── logs ──%s\n" "$c_bold" "$c_reset"
+
+  if command -v idevicesyslog >/dev/null 2>&1; then
+    hw_udid=$(device_hw_udid "$devicectl_id") || true
+    ok "streaming logs from $PRODUCT_NAME via idevicesyslog (Ctrl-C to stop)"
+    trap 'echo; warn "stopped streaming (app keeps running on device)"; exit 0' INT
+    if [[ -n "$hw_udid" ]]; then
+      idevicesyslog -u "$hw_udid" --process "$PRODUCT_NAME" --no-kernel || true
+    else
+      warn "couldn't resolve hardware UDID; using first connected device"
+      idevicesyslog --process "$PRODUCT_NAME" --no-kernel || true
+    fi
+    trap - INT
+  else
+    warn "for full device logs (Logger / os_log / NSLog), install:"
+    printf "    brew install libimobiledevice\n"
+    warn "falling back to devicectl --console (print/stdout only)…"
+    ok "streaming console (Ctrl-C to stop)"
+    trap 'echo; warn "stopped streaming (app may also terminate on device)"; exit 0' INT
+    xcrun devicectl device process launch --console --device "$devicectl_id" "$BUNDLE_ID" || true
+    trap - INT
+  fi
+}
+
+# ─── state ───────────────────────────────────────────────────────────────────
+
+save_state() {
+  local state_file="$1" worktree="$2" kind="$3" udid="$4" display="$5"
+  {
+    printf 'LAST_WORKTREE=%q\n' "$worktree"
+    printf 'LAST_KIND=%q\n'     "$kind"
+    printf 'LAST_UDID=%q\n'     "$udid"
+    printf 'LAST_DISPLAY=%q\n'  "$display"
+  } > "$state_file"
+}
+
+load_state() {
+  local state_file="$1"
+  [[ -f "$state_file" ]] || return 1
+  # shellcheck disable=SC1090
+  source "$state_file"
+  [[ -n "${LAST_WORKTREE:-}" && -d "$LAST_WORKTREE" ]]
+}
+
+# ─── init ────────────────────────────────────────────────────────────────────
+
+# Prompt with a default value. Echoes the user's input, or the default if blank.
+# Args: $1 = prompt text, $2 = default value (may be empty)
+_prompt() {
+  local prompt="$1" default="${2:-}" reply
+  if [[ -n "$default" ]]; then
+    printf "  %s%s%s [%s%s%s]: " \
+      "$c_bold" "$prompt" "$c_reset" \
+      "$c_blue" "$default" "$c_reset" >&2
+  else
+    printf "  %s%s%s: " "$c_bold" "$prompt" "$c_reset" >&2
+  fi
+  IFS= read -r reply </dev/tty
+  echo "${reply:-$default}"
+}
+
+# y/N prompt. Returns 0 for yes, 1 for no. Default is no on blank.
+_confirm() {
+  local prompt="$1" default="${2:-n}" reply suffix
+  suffix=$([[ "$default" == "y" ]] && echo "[Y/n]" || echo "[y/N]")
+  printf "  %s%s%s %s: " "$c_bold" "$prompt" "$c_reset" "$suffix" >&2
+  IFS= read -r reply </dev/tty
+  reply="${reply:-$default}"
+  [[ "$reply" =~ ^[Yy] ]]
+}
+
+# Detect the Xcode project file in the current directory. Echoes the relative
+# path, or nothing if none/multiple are found (and writes diagnostics to stderr).
+_detect_project() {
+  local repo="$1" candidates=()
+  while IFS= read -r line; do
+    candidates+=("$line")
+  done < <(find "$repo" -maxdepth 3 \
+              -name '*.xcworkspace' -o -name '*.xcodeproj' 2>/dev/null \
+            | grep -v '/\.build/' \
+            | grep -v 'xcodeproj/project.xcworkspace' \
+            | sed "s|^$repo/||")
+
+  case "${#candidates[@]}" in
+    0) return 0 ;;
+    1) echo "${candidates[0]}"; return 0 ;;
+    *)
+      # If exactly one .xcworkspace exists, prefer it (CocoaPods/SPM convention)
+      local ws
+      ws=$(printf '%s\n' "${candidates[@]}" | grep '\.xcworkspace$' | head -1 || true)
+      if [[ -n "$ws" ]]; then echo "$ws"; return 0; fi
+      # Otherwise pick the shortest path (usually the top-level project)
+      printf '%s\n' "${candidates[@]}" | awk '{print length, $0}' | sort -n | head -1 | cut -d' ' -f2-
+      ;;
+  esac
+}
+
+# Detect the first scheme that xcodebuild reports for the given project.
+_detect_scheme() {
+  local repo="$1" project="$2" flag
+  case "$project" in
+    *.xcworkspace) flag="-workspace" ;;
+    *)             flag="-project"   ;;
+  esac
+  xcodebuild "$flag" "$repo/$project" -list 2>/dev/null \
+    | awk '/Schemes:/{ found=1; next } found && NF { sub(/^[ \t]+/, ""); print; exit }'
+}
+
+# Detect the BUNDLE_ID from project file by grepping PRODUCT_BUNDLE_IDENTIFIER.
+# Picks the most common value (usually the Debug config matches Release for the app target).
+_detect_bundle_id() {
+  local repo="$1" project="$2" pbxproj
+  # Workspaces don't contain bundle IDs directly; find their referenced .xcodeproj
+  if [[ "$project" == *.xcworkspace ]]; then
+    pbxproj=$(find "$repo" -maxdepth 4 -name 'project.pbxproj' 2>/dev/null \
+              | grep -v "$project/" | head -1)
+  else
+    pbxproj="$repo/$project/project.pbxproj"
+  fi
+  [[ -f "$pbxproj" ]] || return 0
+  # Grep all bundle IDs, drop test/extension/widget targets if obvious, pick most common
+  grep -oE 'PRODUCT_BUNDLE_IDENTIFIER = [^;]+;' "$pbxproj" 2>/dev/null \
+    | sed -E 's/^PRODUCT_BUNDLE_IDENTIFIER = "?([^";]+)"?;/\1/' \
+    | grep -vE '\.(tests?|Tests?|widget|Widget|extension|Extension|ui|UI)$' \
+    | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
+}
+
+# Ensure a pattern is in the repo's .gitignore. No-op if already present.
+# Creates .gitignore if missing. Echoes a friendly confirmation when it
+# actually adds the line.
+_ensure_gitignored() {
+  local repo="$1" pattern="$2"
+  local gitignore="$repo/.gitignore"
+  if [[ -f "$gitignore" ]] && grep -qFx "$pattern" "$gitignore"; then
+    return 0
+  fi
+  # Add a trailing newline first if the existing file lacks one
+  if [[ -f "$gitignore" && -s "$gitignore" ]] && [[ "$(tail -c1 "$gitignore" | wc -l)" == "0" ]]; then
+    printf '\n' >> "$gitignore"
+  fi
+  printf '%s\n' "$pattern" >> "$gitignore"
+  ok "added '$pattern' to .gitignore"
+}
+
+init() {
+  printf "\n%s── gleis init ──%s\n\n" "$c_bold" "$c_reset"
+
+  # Must be in a git repo
+  local repo
+  repo=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || {
+    die "not in a git repo — cd into your iOS project, then run 'gleis init' again"
+  }
+  info "repo: $repo"
+
+  local conf="$repo/.gleis.conf"
+
+  # Handle the "already configured" case
+  if [[ -f "$conf" ]]; then
+    warn ".gleis.conf already exists at $conf"
+    # Show only actual settings (skip blank lines and comments) so the preview
+    # is scannable rather than a wall of template documentation.
+    local non_comment_lines
+    non_comment_lines=$(grep -vE '^[[:space:]]*(#|$)' "$conf" || true)
+    if [[ -n "$non_comment_lines" ]]; then
+      printf "\n  current settings:\n"
+      printf '%s\n' "$non_comment_lines" | sed 's/^/    /'
+      printf "\n"
+    else
+      printf "\n  (file exists but contains no active settings — looks like the example template)\n\n"
+    fi
+    if ! _confirm "Reconfigure (will overwrite)?" "n"; then
+      info "leaving existing config in place"
+      printf "\n  To verify your setup:\n"
+      printf "    gleis doctor\n\n"
+      return 0
+    fi
+    cp "$conf" "$conf.bak.$(date +%s)"
+    ok "backed up existing config to $conf.bak.*"
+    _ensure_gitignored "$repo" ".gleis.conf.bak.*"
+  fi
+
+  # Auto-detect what we can
+  info "scanning project…"
+  local d_project d_scheme d_bundle
+  d_project=$(_detect_project "$repo")
+  if [[ -z "$d_project" ]]; then
+    die "no .xcodeproj or .xcworkspace found in $repo
+  - if your project lives in a subdirectory deeper than 3 levels, this auto-
+    detect won't find it; create .gleis.conf manually (see config/example.conf)"
+  fi
+  d_scheme=$(_detect_scheme "$repo" "$d_project")
+  d_bundle=$(_detect_bundle_id "$repo" "$d_project")
+
+  # Show what we found
+  printf "\n  Detected:\n"
+  printf "    PROJECT     %s\n" "${d_project:-<none>}"
+  printf "    SCHEME      %s\n" "${d_scheme:-<none>}"
+  printf "    BUNDLE_ID   %s\n" "${d_bundle:-<none>}"
+  printf "\n  Press Enter to accept each value, or type a new one:\n\n"
+
+  # Confirm each (allowing user to override)
+  local project scheme bundle config product local_files_input local_files_block=""
+  project=$(_prompt "PROJECT"      "$d_project")
+  scheme=$(_prompt  "SCHEME"       "$d_scheme")
+  bundle=$(_prompt  "BUNDLE_ID"    "$d_bundle")
+  config=$(_prompt  "CONFIG"       "Debug")
+
+  # Optional values — explained in plain language with context before each prompt
+  printf "\n  ──\n"
+  printf "  Two optional settings. Skip both (just press Enter) unless you know you need them.\n"
+  printf "  ──\n\n"
+
+  printf "  PRODUCT_NAME — only needed if your scheme name doesn't match the .app filename.\n"
+  printf "  Example: scheme 'MyApp-Dev' that builds 'MyApp.app'. Most projects: no.\n"
+  if _confirm "Does your scheme produce an .app with a different name?" "n"; then
+    product=$(_prompt "PRODUCT_NAME (actual .app filename without extension)" "$scheme")
+  fi
+
+  printf "\n  LOCAL_FILES — files that are gitignored (e.g. local secrets, API keys) but\n"
+  printf "  needed for builds. Gleis auto-copies them when a new worktree is missing them.\n"
+  if _confirm "Does your project have gitignored files that builds depend on?" "n"; then
+    printf "  Enter one path per line, relative to the repo root.\n"
+    printf "  Example: %sMyApp/SecretsLocal.swift%s\n" "$c_blue" "$c_reset"
+    printf "  Press Enter on an empty line when done.\n"
+    while true; do
+      printf "    > "
+      IFS= read -r local_files_input </dev/tty
+      [[ -z "$local_files_input" ]] && break
+      local_files_block+="  \"$local_files_input\"
+"
+    done
+  fi
+
+  # Validate the required trio
+  [[ -n "$project" && -n "$scheme" && -n "$bundle" ]] \
+    || die "SCHEME, PROJECT, BUNDLE_ID are all required"
+
+  # Write the config
+  {
+    # shellcheck disable=SC2016
+    printf '# gleis config — generated by `gleis init` on %s\n' "$(date '+%Y-%m-%d')"
+    printf 'SCHEME=%q\n'    "$scheme"
+    printf 'PROJECT=%q\n'   "$project"
+    printf 'BUNDLE_ID=%q\n' "$bundle"
+    printf 'CONFIG=%q\n'    "$config"
+    if [[ -n "${product:-}" ]]; then
+      printf 'PRODUCT_NAME=%q\n' "$product"
+    fi
+    if [[ -n "$local_files_block" ]]; then
+      printf '\nLOCAL_FILES=(\n%s)\n' "$local_files_block"
+    fi
+  } > "$conf"
+
+  ok "wrote $conf"
+  printf "\n  Next steps:\n"
+  printf "    1. Review the file:        cat .gleis.conf\n"
+  printf "    2. Verify setup:           gleis doctor\n"
+  printf "    3. Commit when ready:      git add .gleis.conf && git commit -m \"Add gleis config\"\n"
+  printf "    4. Build & launch:         gleis\n\n"
+}
+
+# ─── doctor ──────────────────────────────────────────────────────────────────
+
+# Status row helpers. Each prints one diagnostic line plus, on failure, a "→"
+# suggestion line. Output is intentionally plain so it copy-pastes well.
+_row_ok()   { printf "  %s✓%s %s\n"     "$c_green"  "$c_reset" "$*"; }
+_row_warn() { printf "  %s!%s %s\n"     "$c_yellow" "$c_reset" "$*"; }
+_row_err()  { printf "  %s✗%s %s\n"     "$c_red"    "$c_reset" "$*"; }
+_row_hint() { printf "    %s↳%s %s\n"   "$c_blue"   "$c_reset" "$*"; }
+
+_section() { printf "\n%s%s%s\n" "$c_bold" "$*" "$c_reset"; }
+
+# Returns nonzero if any required check failed. Optional issues report as
+# warnings but don't affect exit code.
+doctor() {
+  local fail=0
+
+  _section "gleis"
+  _row_ok "version $GLEIS_VERSION"
+  local self="$0"
+  if [[ -L "$self" ]]; then
+    local target
+    target=$(readlink "$self")
+    if [[ -f "$target" ]]; then
+      _row_ok "installed at $self → $target"
+    else
+      _row_err "installed at $self but symlink target is broken: $target"
+      _row_hint "reinstall from the gleis repo: ./install.sh"
+      fail=1
+    fi
+  else
+    _row_warn "running directly (not via the installed symlink)"
+    _row_hint "no action needed if you're developing on gleis itself"
+  fi
+
+  _section "required tools"
+  local cmd req_missing=0
+  for cmd in fzf jq xcodebuild xcrun; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      _row_ok "$cmd"
+    else
+      _row_err "$cmd  (missing)"
+      case "$cmd" in
+        xcodebuild|xcrun)
+          _row_hint "install Xcode + command line tools, then: sudo xcode-select --install"
+          ;;
+        *)
+          _row_hint "brew install $cmd"
+          ;;
+      esac
+      req_missing=1
+      fail=1
+    fi
+  done
+  (( req_missing == 0 )) || _row_hint "gleis will refuse to run until the above are installed"
+
+  _section "optional tools"
+  if command -v xcbeautify >/dev/null 2>&1; then
+    _row_ok "xcbeautify — prettier xcodebuild output"
+  else
+    _row_warn "xcbeautify — not installed (build output will be verbose)"
+    _row_hint "brew install xcbeautify"
+  fi
+  if command -v idevicesyslog >/dev/null 2>&1; then
+    _row_ok "idevicesyslog (libimobiledevice) — full device log streaming"
+  else
+    _row_warn "idevicesyslog — not installed"
+    _row_hint "without it, 'gleis -l' on physical devices only sees print()/stdout."
+    _row_hint "install with: brew install libimobiledevice"
+  fi
+
+  _section "xcode"
+  if command -v xcodebuild >/dev/null 2>&1; then
+    local xc_path xc_ver
+    xc_path=$(xcode-select -p 2>/dev/null || echo "?")
+    xc_ver=$(xcodebuild -version 2>/dev/null | head -1 || echo "?")
+    _row_ok "$xc_ver"
+    _row_ok "developer dir: $xc_path"
+    if [[ "$xc_path" != *Xcode.app* ]]; then
+      _row_warn "developer dir is the command line tools, not full Xcode"
+      _row_hint "if builds fail, run: sudo xcode-select -s /Applications/Xcode.app"
+    fi
+  else
+    _row_err "xcodebuild not on PATH; cannot probe Xcode version"
+  fi
+
+  _section "cache"
+  if [[ -d "$CACHE_DIR" ]]; then
+    if [[ -w "$CACHE_DIR" ]]; then
+      local size
+      size=$(du -sh "$CACHE_DIR" 2>/dev/null | awk '{print $1}')
+      _row_ok "$CACHE_DIR (${size:-unknown size})"
+    else
+      _row_err "$CACHE_DIR exists but is not writable"
+      _row_hint "chmod u+w $CACHE_DIR"
+      fail=1
+    fi
+  else
+    _row_ok "$CACHE_DIR (will be created on first run)"
+  fi
+
+  _section "current project"
+  local repo=""
+  repo=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)
+  if [[ -z "$repo" && -n "${GLEIS_REPO:-}" ]]; then
+    repo="$GLEIS_REPO"
+    _row_ok "using GLEIS_REPO fallback: $repo"
+  fi
+  if [[ -z "$repo" ]]; then
+    _row_warn "not inside a git repo"
+    _row_hint "cd into an iOS project repo, or set GLEIS_REPO=/path/to/project"
+    _row_hint "(this is informational; doctor itself works anywhere)"
+  else
+    _row_ok "repo: $repo"
+    # Look for the config files in priority order
+    local cfg="" cand
+    for cand in \
+        "${GLEIS_CONFIG:-}" \
+        "$repo/.gleis.conf" \
+        "$HOME/.config/gleis/$(basename "$repo").conf" \
+        "$HOME/.config/gleis/default.conf"; do
+      [[ -n "$cand" && -f "$cand" ]] && { cfg="$cand"; break; }
+    done
+    if [[ -z "$cfg" ]]; then
+      _row_err "no config found for this repo"
+      _row_hint "create $repo/.gleis.conf — see config/example.conf in the gleis repo"
+      fail=1
+    else
+      _row_ok "config: $cfg"
+      # Try to load it without dying — re-do load_config inline with no exits
+      local SCHEME="" PROJECT="" BUNDLE_ID="" PRODUCT_NAME="" CONFIG="Debug"
+      local LOCAL_FILES=()
+      # shellcheck disable=SC1090
+      if ( source "$cfg" 2>/dev/null && \
+            [[ -n "$SCHEME" && -n "$PROJECT" && -n "$BUNDLE_ID" ]] ); then
+        _row_ok "config parses; SCHEME/PROJECT/BUNDLE_ID set"
+      else
+        _row_err "config missing one of SCHEME/PROJECT/BUNDLE_ID"
+        fail=1
+      fi
+      # shellcheck disable=SC1090
+      source "$cfg" 2>/dev/null || true
+      if [[ -n "$PROJECT" && -e "$repo/$PROJECT" ]]; then
+        _row_ok "PROJECT exists: $repo/$PROJECT"
+      elif [[ -n "$PROJECT" ]]; then
+        _row_err "PROJECT not found at $repo/$PROJECT"
+        _row_hint "fix the PROJECT value in $cfg"
+        fail=1
+      fi
+    fi
+  fi
+
+  _section "destinations"
+  local sim_count dev_count
+  if command -v xcrun >/dev/null 2>&1; then
+    sim_count=$(xcrun simctl list devices --json available 2>/dev/null \
+      | jq '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.isAvailable == true)] | length' 2>/dev/null \
+      || echo 0)
+    _row_ok "$sim_count iOS simulator(s) available"
+
+    local dtmp
+    dtmp=$(mktemp) || dtmp=""
+    if [[ -n "$dtmp" ]] && xcrun devicectl list devices --json-output "$dtmp" >/dev/null 2>&1; then
+      dev_count=$(jq '[.result.devices // [] | .[] | select(.connectionProperties.tunnelState == "connected") | select((.hardwareProperties.platform // "") == "iOS")] | length' < "$dtmp" 2>/dev/null || echo 0)
+      if [[ "$dev_count" -gt 0 ]]; then
+        _row_ok "$dev_count physical device(s) connected"
+        jq -r '
+          (.result.devices // [])[]
+          | select(.connectionProperties.tunnelState == "connected")
+          | select((.hardwareProperties.platform // "") == "iOS")
+          | "      — \(.deviceProperties.name) (iOS \(.deviceProperties.osVersionNumber), \(.connectionProperties.transportType))"
+        ' < "$dtmp" 2>/dev/null
+      else
+        _row_warn "no physical iOS devices connected"
+        _row_hint "plug in an iPhone, unlock it, and trust this Mac"
+        _row_hint "ensure Developer Mode is on (Settings → Privacy & Security → Developer Mode)"
+      fi
+      rm -f "$dtmp"
+    else
+      _row_warn "devicectl unavailable — can't enumerate physical devices"
+      [[ -n "$dtmp" ]] && rm -f "$dtmp"
+    fi
+  else
+    _row_err "xcrun not available; cannot probe destinations"
+  fi
+
+  echo
+  if (( fail )); then
+    printf "%sFound issues that will prevent gleis from working.%s\n" "$c_red" "$c_reset"
+    return 1
+  fi
+  printf "%sAll required checks passed.%s\n" "$c_green" "$c_reset"
+  return 0
+}
+
+# ─── main ────────────────────────────────────────────────────────────────────
+
+usage() {
+  sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+main() {
+  local mode="pick" preselect="" clean=0 launch=1 logs=0
+
+  while (( $# )); do
+    case "$1" in
+      -h|--help)        usage 0 ;;
+      --version)        echo "gleis $GLEIS_VERSION"; exit 0 ;;
+      --last)           mode="last" ;;
+      -d|--destination) mode="dest" ;;
+      -w|--worktree)    mode="wt" ;;
+      -l|--logs)        logs=1 ;;
+      --clean)          clean=1 ;;
+      --no-launch)      launch=0 ;;
+      -*)               die "unknown flag: $1" ;;
+      *)                preselect="$1" ;;
+    esac
+    shift
+  done
+
+  local repo state_file
+  repo=$(repo_root)
+  state_file=$(state_file_for_repo "$repo")
+  load_config "$repo"
+
+  local worktree kind udid display row
+  case "$mode" in
+    last)
+      load_state "$state_file" || die "no saved state for this repo — run 'gleis' once first"
+      worktree="$LAST_WORKTREE" kind="$LAST_KIND"
+      udid="$LAST_UDID"         display="$LAST_DISPLAY"
+      ;;
+    dest)
+      load_state "$state_file" || die "no saved state for this repo — run 'gleis' once first"
+      worktree="$LAST_WORKTREE"
+      row=$(select_destination)
+      IFS=$'\t' read -r kind udid display <<<"$row"
+      ;;
+    wt)
+      load_state "$state_file" || die "no saved state for this repo — run 'gleis' once first"
+      kind="$LAST_KIND" udid="$LAST_UDID" display="$LAST_DISPLAY"
+      worktree=$(select_worktree "$preselect")
+      ;;
+    *)
+      worktree=$(select_worktree "$preselect")
+      row=$(select_destination)
+      IFS=$'\t' read -r kind udid display <<<"$row"
+      ;;
+  esac
+
+  save_state "$state_file" "$worktree" "$kind" "$udid" "$display"
+  build_and_launch "$worktree" "$kind" "$udid" "$display" "$clean" "$launch" "$logs"
+}
+
+if [[ -n "${GLEIS_INIT_MODE:-}" ]]; then
+  init
+  exit $?
+fi
+
+if [[ -n "${GLEIS_DOCTOR_MODE:-}" ]]; then
+  doctor
+  exit $?
+fi
+
+main "$@"
