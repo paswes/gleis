@@ -212,18 +212,24 @@ $(echo "$schemes" | sed 's/^/    /')"
 
 # ─── worktrees ───────────────────────────────────────────────────────────────
 
-# Output: <path>\t<branch-or-HEAD>  for each worktree containing $PROJECT
-list_worktrees() {
-  local path branch repo
-  repo=$(repo_root)
+# Output: <path>\t<branch-or-HEAD>  for each worktree of repo $1 that contains
+# project $2. Takes both explicitly (rather than reading globals) so callers
+# that must not die — e.g. doctor — can use it without going through repo_root.
+_worktrees_with_project() {
+  local repo="$1" project="$2" path branch
   git -C "$repo" worktree list --porcelain | awk '
     /^worktree / { p=substr($0,10); b="(detached)"; next }
     /^branch /   { b=substr($0,8); sub(/^refs\/heads\//, "", b); next }
     /^$/         { if (p) print p "\t" b; p="" }
     END          { if (p) print p "\t" b }
   ' | while IFS=$'\t' read -r path branch; do
-    [[ -e "$path/$PROJECT" ]] && printf '%s\t%s\n' "$path" "$branch"
+    [[ -e "$path/$project" ]] && printf '%s\t%s\n' "$path" "$branch"
   done
+}
+
+# Output: <path>\t<branch-or-HEAD>  for each worktree containing $PROJECT
+list_worktrees() {
+  _worktrees_with_project "$(repo_root)" "$PROJECT"
 }
 
 # Echoes selected worktree path
@@ -374,11 +380,47 @@ ensure_local_files() {
   done
 }
 
+# Per-destination primitives shared by the build flow. Each switches on kind
+# (sim|dev) so build_and_launch stays a single linear install→launch path.
+
+# Make the destination ready to receive an install. Sim: boot it and surface
+# Simulator.app. Device: nothing to do.
+prepare_destination() {
+  local kind="$1" udid="$2"
+  [[ "$kind" == "sim" ]] || return 0
+  info "ensuring simulator is booted…"
+  xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 \
+    || xcrun simctl boot "$udid" >/dev/null 2>&1 || true
+  open -a Simulator
+}
+
+install_app() {
+  local kind="$1" udid="$2" app_path="$3"
+  if [[ "$kind" == "sim" ]]; then
+    xcrun simctl install "$udid" "$app_path"
+  else
+    xcrun devicectl device install app --device "$udid" "$app_path"
+  fi
+}
+
+# Launch the installed app. Sim terminates any running copy first so the launch
+# is a clean start rather than a no-op on an already-running process.
+launch_app() {
+  local kind="$1" udid="$2"
+  if [[ "$kind" == "sim" ]]; then
+    xcrun simctl terminate "$udid" "$BUNDLE_ID" >/dev/null 2>&1 || true
+    xcrun simctl launch "$udid" "$BUNDLE_ID" >/dev/null
+  else
+    xcrun devicectl device process launch --device "$udid" "$BUNDLE_ID" >/dev/null
+  fi
+}
+
 build_and_launch() {
   local worktree="$1" kind="$2" udid="$3" display="$4" clean="$5" launch="$6" logs="$7"
-  local derived dest_arg lock_dir
-  derived="$CACHE_DIR/build/$(worktree_slug "$worktree")/DerivedData"
-  lock_dir="$CACHE_DIR/build/$(worktree_slug "$worktree")/.lock"
+  local slug derived dest_arg lock_dir
+  slug=$(worktree_slug "$worktree")
+  derived="$CACHE_DIR/build/$slug/DerivedData"
+  lock_dir="$CACHE_DIR/build/$slug/.lock"
 
   if [[ "$kind" == "sim" ]]; then
     dest_arg="platform=iOS Simulator,id=$udid"
@@ -458,40 +500,24 @@ build_and_launch() {
     BUNDLE_ID="$actual_bundle_id"
   fi
 
-  if [[ "$kind" == "sim" ]]; then
-    info "ensuring simulator is booted…"
-    xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1 \
-      || xcrun simctl boot "$udid" >/dev/null 2>&1 || true
-    open -a Simulator
-    info "installing $PRODUCT_NAME.app…"
-    xcrun simctl install "$udid" "$app_path"
-    xcrun simctl terminate "$udid" "$BUNDLE_ID" >/dev/null 2>&1 || true
-    if [[ "$launch" != "1" ]]; then
-      ok "installed on $display (skipped launch)"
-      return 0
-    fi
-    info "launching ${BUNDLE_ID}…"
-    xcrun simctl launch "$udid" "$BUNDLE_ID" >/dev/null
-    ok "running on $display"
-    if [[ "$logs" == "1" ]]; then
+  prepare_destination "$kind" "$udid"
+
+  info "installing $PRODUCT_NAME…"
+  install_app "$kind" "$udid" "$app_path"
+  if [[ "$launch" != "1" ]]; then
+    ok "installed on $display (skipped launch)"
+    return 0
+  fi
+
+  info "launching ${BUNDLE_ID}…"
+  launch_app "$kind" "$udid"
+  ok "running on $display"
+
+  if [[ "$logs" == "1" ]]; then
+    if [[ "$kind" == "sim" ]]; then
       stream_logs_sim "$udid"
-    fi
-  else
-    info "installing on device…"
-    xcrun devicectl device install app --device "$udid" "$app_path"
-    if [[ "$launch" != "1" ]]; then
-      ok "installed on $display (skipped launch)"
-      return 0
-    fi
-    if [[ "$logs" == "1" ]]; then
-      info "launching ${BUNDLE_ID}…"
-      xcrun devicectl device process launch --device "$udid" "$BUNDLE_ID" >/dev/null
-      ok "running on $display"
-      stream_logs_dev "$udid"
     else
-      info "launching ${BUNDLE_ID}…"
-      xcrun devicectl device process launch --device "$udid" "$BUNDLE_ID"
-      ok "running on $display"
+      stream_logs_dev "$udid"
     fi
   fi
 }
