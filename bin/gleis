@@ -1100,10 +1100,27 @@ ship() {
   repo=$(repo_root)
   load_config "$repo"
   require_ship_config
+  require vercel
 
   worktree="$repo"            # ship targets the worktree you're standing in
   slug=$(worktree_slug "$worktree")
   ship_dir="$CACHE_DIR/ship/$slug"
+
+  # Resolve the export-options plist: a checked-in EXPORT_OPTIONS (default
+  # ./ExportOptions.plist at the worktree root) wins; otherwise we generate one
+  # from TEAM_ID / SHIP_METHOD / SHIP_SIGNING into the ship cache before export.
+  local export_opts export_opts_src
+  case "${EXPORT_OPTIONS:-}" in
+    "")  export_opts="$worktree/ExportOptions.plist" ;;
+    /*)  export_opts="$EXPORT_OPTIONS" ;;
+    *)   export_opts="$worktree/${EXPORT_OPTIONS#./}" ;;
+  esac
+  if [[ -f "$export_opts" ]]; then
+    export_opts_src="checked-in"
+  else
+    export_opts_src="generated"
+    export_opts="$ship_dir/ExportOptions.plist"
+  fi
 
   printf "\n%s── gleis ship ──%s\n" "$c_bold" "$c_reset"
   info "worktree:    $worktree"
@@ -1111,10 +1128,10 @@ ship() {
   info "bundle id:   $BUNDLE_ID"
   info "team:        $TEAM_ID"
   info "method:      $SHIP_METHOD  (signing: $SHIP_SIGNING)"
-  if [[ -n "$EXPORT_OPTIONS" ]]; then
-    info "export opts: $EXPORT_OPTIONS (custom plist)"
+  if [[ "$export_opts_src" == "checked-in" ]]; then
+    info "export opts: $export_opts (checked-in)"
   else
-    info "export opts: generated from team / method / signing"
+    info "export opts: generated ($SHIP_METHOD / $SHIP_SIGNING / team $TEAM_ID)"
   fi
   info "title:       $SHIP_TITLE"
   info "deploy:      $VERCEL_PROJECT → https://$SHIP_DOMAIN"
@@ -1128,8 +1145,188 @@ ship() {
   fi
 
   echo
-  warn "build + deploy aren't wired up yet — this scaffold only validates config"
-  info "coming next: xcodebuild archive → export .ipa → OTA manifest → Vercel deploy"
+  local buildnum lock_dir archive_path export_dir deploy_dir linked_project
+  local market_version ipa deploy_url install_url
+  buildnum=$(date +%s)
+  archive_path="$ship_dir/$PRODUCT_NAME.xcarchive"
+  export_dir="$ship_dir/export"
+  deploy_dir="$CACHE_DIR/ship/deploy"
+  lock_dir="$ship_dir/.lock"
+
+  # The deploy dir is set up once (linked to Vercel, with its own vercel.json)
+  # and lives outside gleis's control — verify it before the slow archive rather
+  # than after. gleis never creates or edits vercel.json / .vercel/.
+  [[ -f "$deploy_dir/.vercel/project.json" && -f "$deploy_dir/vercel.json" ]] \
+    || die "deploy dir isn't set up: $deploy_dir
+  it must be a Vercel-linked folder (needs vercel.json and .vercel/project.json).
+  set it up once and link it to your '$VERCEL_PROJECT' project, then re-run."
+  linked_project=$(jq -r '.projectName // empty' "$deploy_dir/.vercel/project.json" 2>/dev/null || true)
+  [[ -z "$linked_project" || "$linked_project" == "$VERCEL_PROJECT" ]] \
+    || warn "deploy dir is linked to Vercel project '$linked_project', not '$VERCEL_PROJECT'"
+
+  # Per-worktree ship lock, separate from the build lock (build_and_launch) so a
+  # build and a ship on the same worktree don't share a lock — ship has its own
+  # DerivedData and archives a release config, so they never touch the same
+  # files. Two concurrent ships *would* race on the archive/export/deploy paths,
+  # which this prevents.
+  mkdir -p "$ship_dir"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    die "another gleis ship is already running for this worktree
+  if you're sure nothing else is running, remove: $lock_dir"
+  fi
+  # Bake lock_dir's value into the trap now so it survives the function returning
+  # under `set -u` (same reasoning as build_and_launch).
+  # shellcheck disable=SC2064  # early expansion is intentional
+  trap "$(printf 'rmdir %q 2>/dev/null || true' "$lock_dir")" EXIT INT TERM
+
+  cd "$worktree"
+  ensure_local_files "$worktree"
+
+  # ── archive ──
+  info "archiving $PRODUCT_NAME (build $buildnum)…"
+  rm -rf "$archive_path"
+  local xc_archive=(
+    xcodebuild
+    "$PROJECT_FLAG" "$PROJECT"
+    -scheme "$SCHEME"
+    -configuration "$SHIP_CONFIG"
+    -destination "generic/platform=iOS"
+    -archivePath "$archive_path"
+    -derivedDataPath "$ship_dir/DerivedData"
+    "CURRENT_PROJECT_VERSION=$buildnum"
+    -quiet
+    archive
+  )
+  [[ "$SHIP_SIGNING" == "automatic" ]] && xc_archive+=(-allowProvisioningUpdates)
+  if command -v xcbeautify >/dev/null 2>&1; then
+    "${xc_archive[@]}" 2>&1 | xcbeautify --quiet
+  else
+    "${xc_archive[@]}"
+  fi
+  [[ -d "$archive_path" ]] || die "archive failed — no .xcarchive at $archive_path"
+  ok "archived"
+
+  # Marketing version is for the ship record/summary; the build number is what we
+  # just stamped via CURRENT_PROJECT_VERSION.
+  market_version=$(defaults read \
+    "$archive_path/Products/Applications/$PRODUCT_NAME.app/Info" \
+    CFBundleShortVersionString 2>/dev/null || echo "?")
+
+  # ── export a signed .ipa ──
+  if [[ "$export_opts_src" == "generated" ]]; then
+    info "generating ExportOptions.plist…"
+    cat > "$export_opts" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>method</key><string>$SHIP_METHOD</string>
+  <key>teamID</key><string>$TEAM_ID</string>
+  <key>signingStyle</key><string>$SHIP_SIGNING</string>
+  <key>compileBitcode</key><false/>
+  <key>stripSwiftSymbols</key><true/>
+</dict>
+</plist>
+EOF
+  fi
+
+  info "exporting .ipa…"
+  rm -rf "$export_dir"
+  local xc_export=(
+    xcodebuild
+    -exportArchive
+    -archivePath "$archive_path"
+    -exportOptionsPlist "$export_opts"
+    -exportPath "$export_dir"
+  )
+  [[ "$SHIP_SIGNING" == "automatic" ]] && xc_export+=(-allowProvisioningUpdates)
+  if command -v xcbeautify >/dev/null 2>&1; then
+    "${xc_export[@]}" 2>&1 | xcbeautify --quiet
+  else
+    "${xc_export[@]}"
+  fi
+  ipa=$(find "$export_dir" -maxdepth 1 -name '*.ipa' 2>/dev/null || true)
+  [[ -n "$ipa" && -f "$ipa" ]] || die "export produced no .ipa in $export_dir
+  check signing (TEAM_ID=$TEAM_ID, SHIP_SIGNING=$SHIP_SIGNING) and your export options."
+  ok "exported $(basename "$ipa")"
+
+  # ── stage the pre-linked deploy dir ──
+  # Only now, with a valid .ipa in hand, do we touch the deploy dir, so a failed
+  # archive/export never leaves it half-staged. vercel.json / .vercel/ are left
+  # untouched; manifest.plist and index.html are regenerated each ship.
+  info "staging deploy → $deploy_dir"
+  cp "$ipa" "$deploy_dir/$PRODUCT_NAME.ipa"
+
+  cat > "$deploy_dir/manifest.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>items</key>
+  <array>
+    <dict>
+      <key>assets</key>
+      <array>
+        <dict>
+          <key>kind</key><string>software-package</string>
+          <key>url</key><string>https://$SHIP_DOMAIN/$PRODUCT_NAME.ipa</string>
+        </dict>
+      </array>
+      <key>metadata</key>
+      <dict>
+        <key>bundle-identifier</key><string>$BUNDLE_ID</string>
+        <key>bundle-version</key><string>$buildnum</string>
+        <key>kind</key><string>software</string>
+        <key>title</key><string>$SHIP_TITLE</string>
+      </dict>
+    </dict>
+  </array>
+</dict>
+</plist>
+EOF
+
+  cat > "$deploy_dir/index.html" <<EOF
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Install $SHIP_TITLE</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 0; min-height: 100vh;
+           display: flex; align-items: center; justify-content: center; background: #f2f2f7; color: #1c1c1e; }
+    .card { text-align: center; padding: 2rem; }
+    h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+    p { color: #8e8e93; margin: 0; }
+    a.btn { display: inline-block; margin-top: 1.5rem; padding: .85rem 2rem; background: #007aff;
+            color: #fff; text-decoration: none; border-radius: 12px; font-weight: 600; font-size: 1.1rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>$SHIP_TITLE</h1>
+    <p>Build $buildnum</p>
+    <a class="btn" href="itms-services://?action=download-manifest&amp;url=https://$SHIP_DOMAIN/manifest.plist">Install $SHIP_TITLE</a>
+  </div>
+</body>
+</html>
+EOF
+
+  # ── deploy ──
+  info "deploying to Vercel ($VERCEL_PROJECT)…"
+  deploy_url=$(vercel deploy --prod --yes --cwd "$deploy_dir") \
+    || die "vercel deploy failed — see the output above
+  your signed .ipa is still at: $ipa"
+
+  # ── record + summarize ──
+  install_url="https://$SHIP_DOMAIN/"
+  save_ship_state "$ship_state" "$market_version" "$buildnum" "$install_url"
+
+  echo
+  ok "shipped $SHIP_TITLE $market_version (build $buildnum)"
+  info "install URL: $install_url"
+  info "deployment:  $deploy_url"
+  info "on your iPhone: open $install_url in Safari and tap Install $SHIP_TITLE"
 }
 
 # ─── prune ───────────────────────────────────────────────────────────────────
