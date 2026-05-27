@@ -10,10 +10,16 @@
 #   gleis <branch-substring>      preselect worktree by branch fuzzy-match
 #   gleis -l, --logs              stream app logs after launch (Ctrl-C to stop)
 #   gleis --no-launch             build + install only, don't launch
-#   gleis --clean                 wipe this worktree's DerivedData first
+#   gleis --clean                 wipe THIS worktree's DerivedData, then build
 #   gleis init                    create .gleis.conf for the current project
 #   gleis doctor                  diagnose your gleis setup
+#   gleis prune [--all]           reclaim build-cache disk from deleted worktrees
 #   gleis --version               print version
+#
+# Examples:
+#   gleis                         first run: pick a worktree, then a destination
+#   gleis --last                  fastest inner loop: repeat the last build
+#   gleis polish -l               build the 'polish' worktree, then stream logs
 #
 # Requires: fzf, jq, xcodebuild, xcrun  (xcbeautify optional, used if present)
 #
@@ -36,7 +42,7 @@
 #                    (default: same as SCHEME)
 #     LOCAL_FILES  — array of gitignored files to auto-copy across worktrees
 
-readonly GLEIS_VERSION="1.0.0"
+readonly GLEIS_VERSION="1.1.0"
 
 set -euo pipefail
 
@@ -68,7 +74,7 @@ require() {
 for arg in "$@"; do
   case "$arg" in
     -h|--help)
-      sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     --version)
@@ -1146,7 +1152,7 @@ doctor() {
 # ─── main ────────────────────────────────────────────────────────────────────
 
 usage() {
-  sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 

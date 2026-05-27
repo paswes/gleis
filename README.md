@@ -27,8 +27,8 @@ That's the whole flow. Read on for the details.
 ## Install
 
 ```sh
-git clone <your-private-repo-url> ~/dev/tools/gleis
-cd ~/dev/tools/gleis
+git clone <repo-url> ~/Developer/tools/gleis
+cd ~/Developer/tools/gleis
 ./install.sh
 ```
 
@@ -70,6 +70,8 @@ BUNDLE_ID="com.example.myapp"
 
 See `config/example.conf` for all available options, including `LOCAL_FILES`, `PRODUCT_NAME`, and `CONFIG` (e.g. `Debug-Staging`).
 
+**`LOCAL_FILES` workflow.** These are gitignored files a build needs but git won't carry across worktrees — local secrets, API keys, generated config. List them in `LOCAL_FILES` and gleis copies them into any worktree that's missing them, from another worktree that has them. Create the files once in any worktree; from then on every new worktree is seeded automatically on first build. (If no worktree has them yet, gleis tells you to recreate them.)
+
 **Where else it can live.** If you don't want the config in the repo (e.g. shared repo with collaborators who don't use gleis), it can live in `~/.config/gleis/<repo-name>.conf` instead. Gleis searches in this order, first hit wins:
 
 ```
@@ -78,6 +80,13 @@ $GLEIS_CONFIG (if set)
 ~/.config/gleis/<repo-name>.conf
 ~/.config/gleis/default.conf
 ```
+
+### Environment variables
+
+Both are optional and meant for your shell config:
+
+- **`GLEIS_CONFIG`** — absolute path to a config file that wins over all of the above. Handy for pointing gleis at a config outside the repo.
+- **`GLEIS_REPO`** — a repo root to fall back to *only when you're not inside a git repo*. Lets `gleis` run from anywhere without hijacking runs in other projects (an enclosing repo always takes precedence).
 
 ## Usage
 
@@ -91,9 +100,10 @@ gleis -w, --worktree        keep last destination, pick a new worktree
 gleis <branch-substring>    preselect worktree by branch fuzzy-match
 gleis -l, --logs            stream app logs after launch (Ctrl-C to stop)
 gleis --no-launch           build + install only, don't launch
-gleis --clean               wipe this worktree's DerivedData first
+gleis --clean               wipe THIS worktree's DerivedData, then build
 gleis init                  create .gleis.conf for the current project
 gleis doctor                diagnose your gleis setup
+gleis prune [--all]         reclaim build-cache disk from deleted worktrees
 gleis --version             print version
 gleis -h, --help            show usage
 ```
@@ -118,16 +128,18 @@ The four navigation modes form a clean 2×2:
 
 | What                | Where                                                          |
 | ------------------- | -------------------------------------------------------------- |
-| Last selection      | `~/Library/Caches/gleis/state/<repo-name>` (per repo)             |
+| Last selection      | `~/Library/Caches/gleis/state/<repo-name>-<hash>` (per repo)       |
 | Per-worktree builds | `~/Library/Caches/gleis/build/<sha1-prefix>/DerivedData/`         |
 | Configs             | `<repo>/.gleis.conf` or `~/.config/gleis/`                           |
 
-State is per-repo, so `gleis --last` in one project doesn't get confused by another.
+State is per-repo, so `gleis --last` in one project doesn't get confused by another. The `<hash>` keys the path, so two repos that happen to share a name don't collide.
+
+Per-worktree build caches accumulate as you create and delete worktrees. Run `gleis prune` to drop caches whose worktree no longer exists (or `gleis prune --all` to clear them all); `gleis doctor` reports the current cache size.
 
 ## Updating
 
 ```sh
-cd ~/dev/tools/gleis
+cd ~/Developer/tools/gleis
 git pull
 ```
 
@@ -136,7 +148,7 @@ That's it. The symlink picks up changes immediately.
 ## Uninstall
 
 ```sh
-cd ~/dev/tools/gleis
+cd ~/Developer/tools/gleis
 ./uninstall.sh
 ```
 
@@ -148,7 +160,7 @@ Removes the symlink. Repo, configs, and caches are left intact — delete them m
 
 **"no config found"** — create `<repo>/.gleis.conf` or `~/.config/gleis/default.conf`. See `config/example.conf` in this repo.
 
-**"no worktrees with <PROJECT> found"** — your config's `PROJECT` value doesn't match any worktree. Check with `ls *.xcodeproj` in a worktree root.
+**"no worktrees contain <PROJECT>"** — your config's `PROJECT` value doesn't match any worktree. Run `git worktree list` to see them, and check the `PROJECT` value in your config.
 
 **Device install fails with signing error** — open the project in Xcode once, let it provision the device, then re-run `gleis`.
 
