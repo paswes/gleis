@@ -38,7 +38,7 @@ Dependencies (installer will warn you if they're missing):
 
 ```sh
 brew install fzf jq xcbeautify        # required + recommended
-brew install libimobiledevice         # optional: full unified-log streaming from devices
+brew install libimobiledevice         # recommended: Xcode-style device logs
 ```
 
 ## Configure for your project
@@ -98,7 +98,8 @@ gleis --last                rebuild last worktree on last destination
 gleis -d, --destination     keep last worktree, pick a new destination
 gleis -w, --worktree        keep last destination, pick a new worktree
 gleis <text>                match worktree path/branch, then pick destination
-gleis -l, --logs            stream app logs after launch (Ctrl-C to stop)
+gleis -l, --logs            launch with console attached (Ctrl-C to stop)
+gleis --verbose-logs        with --logs, show raw unfiltered device logs
 gleis --no-launch           build + install only, don't launch
 gleis --clean               clean rebuild: wipe selected worktree's DerivedData
 gleis init                  create .gleis.conf for the current project
@@ -141,7 +142,7 @@ Cleanup commands have different scopes:
 3. `xcodebuild build` with `-derivedDataPath ~/Library/Caches/gleis/build/<worktree-hash>/`. Each worktree gets isolated build state — switching worktrees doesn't invalidate caches.
 4. The right product folder is selected based on destination (`Debug-iphonesimulator` for sims, `Debug-iphoneos` for devices).
 5. Install + launch via `simctl` (sim) or `devicectl` (device).
-6. With `--logs`: stream via `simctl spawn log stream` (sim) or `idevicesyslog` (device, full unified log) with `devicectl --console` as fallback when `libimobiledevice` isn't installed.
+6. With `--logs`: launch with the app console attached on simulators, and on physical devices start `idevicesyslog` before launch so Xcode-style device logs are captured from process start. Physical-device logs are focused by default: gleis keeps app/app-debug-dylib messages, strips the syslog prefix, and hides framework startup chatter. Add `--verbose-logs` to show the raw stream. If `libimobiledevice` is not installed, device logging falls back to `devicectl ... launch --console`.
 
 ## State
 
@@ -191,12 +192,12 @@ everything without a prompt:
 
 **Build succeeds but app behaves wrong** — try `gleis --clean --last` to wipe DerivedData. Mostly needed after build-setting or signing changes.
 
-**`--logs` on device shows nothing** — your app probably uses `os_log`/`Logger`, which the default `devicectl --console` can't see. Install `brew install libimobiledevice` and `gleis` will switch to `idevicesyslog` automatically.
+**`--logs` on device shows only "Waiting for the application to terminate…"** — install `libimobiledevice` with `brew install libimobiledevice`. Without `idevicesyslog`, Apple's `devicectl --console` only attaches app stdout/stderr and may not show the same unified/debug console entries Xcode displays.
 
 ## Extending
 
 The script is one bash file (`bin/gleis`). Common changes:
 
 - **New flag**: add a `case` arm in `main()`, wire it through.
-- **Different log filter**: edit `stream_logs_sim` / `stream_logs_dev`.
+- **Different launch/log behavior**: edit `launch_app_console`.
 - **Non-iOS support** (macOS/watchOS/tvOS): currently the picker only lists iOS sims/devices. Generalizing it is a bigger change — open an issue or PR.

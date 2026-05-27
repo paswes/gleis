@@ -8,7 +8,8 @@
 #   gleis -d, --destination       keep last worktree, pick a new destination
 #   gleis -w, --worktree          keep last destination, pick a new worktree
 #   gleis <text>                  match worktree path/branch, then pick destination
-#   gleis -l, --logs              stream app logs after launch (Ctrl-C to stop)
+#   gleis -l, --logs              launch with console attached (Ctrl-C to stop)
+#   gleis --verbose-logs          with --logs, show raw unfiltered device logs
 #   gleis --no-launch             build + install only, don't launch
 #   gleis --clean                 clean rebuild: wipe selected worktree's DerivedData
 #   gleis init                    create .gleis.conf for the current project
@@ -44,7 +45,7 @@
 #                    (default: same as SCHEME)
 #     LOCAL_FILES  — array of gitignored files to auto-copy across worktrees
 
-readonly GLEIS_VERSION="1.1.2"
+readonly GLEIS_VERSION="1.1.6"
 
 set -euo pipefail
 
@@ -76,7 +77,7 @@ require() {
 for arg in "$@"; do
   case "$arg" in
     -h|--help)
-      sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     --version)
@@ -435,8 +436,129 @@ launch_app() {
   fi
 }
 
+# Launch with the app's standard streams attached. This is the mode closest to
+# Xcode's debug console: stdout/stderr are connected from process start.
+launch_app_console() {
+  local kind="$1" udid="$2" verbose_logs="$3"
+  printf "%s── logs ──%s\n" "$c_bold" "$c_reset"
+
+  if [[ "$kind" == "sim" ]]; then
+    ok "launching $PRODUCT_NAME with console attached (Ctrl-C to stop)"
+    trap 'echo; warn "stopped console session"; exit 0' INT
+    xcrun simctl launch --console --terminate-running-process "$udid" "$BUNDLE_ID" || true
+    trap - INT
+  else
+    launch_device_with_logs "$udid" "$verbose_logs"
+  fi
+}
+
+device_hw_udid() {
+  local devicectl_id="$1" json out
+  json=$(_devicectl_json) || return 1
+  out=$(echo "$json" | jq -r --arg id "$devicectl_id" '
+    (.result.devices // [])[]
+    | select(.identifier == $id)
+    | .hardwareProperties.udid
+  ' 2>/dev/null)
+  [[ -n "$out" && "$out" != "null" ]] && echo "$out"
+}
+
+launch_device_with_logs() {
+  local devicectl_id="$1" verbose_logs="$2" hw_udid="" log_pid="" log_cmd=()
+
+  if command -v idevicesyslog >/dev/null 2>&1; then
+    hw_udid=$(device_hw_udid "$devicectl_id") || true
+    if [[ -n "$hw_udid" ]]; then
+      log_cmd=(idevicesyslog -u "$hw_udid" --process "$PRODUCT_NAME")
+    else
+      warn "couldn't resolve hardware UDID; using first connected device for logs"
+      log_cmd=(idevicesyslog --process "$PRODUCT_NAME")
+    fi
+
+    if [[ "$verbose_logs" == "1" ]]; then
+      ok "streaming raw device logs from $PRODUCT_NAME and launching app (Ctrl-C to stop)"
+      "${log_cmd[@]}" &
+    else
+      ok "streaming focused app logs from $PRODUCT_NAME and launching app (Ctrl-C to stop)"
+      "${log_cmd[@]}" | filter_device_logs "$PRODUCT_NAME" &
+    fi
+    log_pid=$!
+    # Give the syslog relay a moment to subscribe before app startup messages.
+    sleep 0.5
+  else
+    warn "idevicesyslog not found; falling back to attached stdout/stderr only"
+    warn "install with: brew install libimobiledevice"
+    ok "launching $PRODUCT_NAME with console attached (Ctrl-C to stop)"
+  fi
+
+  # shellcheck disable=SC2064  # early expansion captures the current log pid.
+  trap "$(printf 'echo; [[ -n %q ]] && kill %q 2>/dev/null || true; warn \"stopped log session\"; exit 0' "$log_pid" "$log_pid")" INT
+  xcrun devicectl device process launch \
+    --console \
+    --terminate-existing \
+    --device "$devicectl_id" \
+    "$BUNDLE_ID" || true
+
+  [[ -n "$log_pid" ]] && kill "$log_pid" 2>/dev/null || true
+  trap - INT
+}
+
+filter_device_logs() {
+  local product="$1"
+  awk -v product="$product" '
+    function emit(line) {
+      print line
+      fflush()
+    }
+
+    function is_noise(message) {
+      return message ~ /Looking up debug dylib/ ||
+        message ~ /Found debug dylib/ ||
+        message ~ /debug dylib .* entry point/ ||
+        message ~ /Previews JIT/ ||
+        message ~ /PreviewInjection/ ||
+        message ~ /Using ~iphone resources/ ||
+        message ~ /main bundle CFBundle .* getting handle/ ||
+        message ~ /CFPrefsSource/ ||
+        message ~ /networkd_settings_read_from_file_locked/ ||
+        message ~ /fopen failed for data file/ ||
+        message ~ /nw_connection_/ ||
+        message ~ /cfnetwork:/ ||
+        message ~ /Connection [0-9]+/ ||
+        message ~ /Task <.*>/ ||
+        message ~ /nw_protocol_/ ||
+        message ~ /nw_flow_/ ||
+        message ~ /ne_tracker_/
+    }
+
+    {
+      line = $0
+      message = line
+      sub(/^[^ ]+ +[^ ]+ +[^ ]+ +[^ ]+ +<[^>]+>: /, "", message)
+
+      source = ""
+      token = $4
+      if (index(token, product "(") == 1) {
+        source = token
+        sub(/^.*\(/, "", source)
+        sub(/\).*$/, "", source)
+      } else if (index(token, product "[") == 1) {
+        source = product
+      } else {
+        next
+      }
+
+      if (source == product || source == product ".debug.dylib") {
+        if (!is_noise(message)) {
+          emit(message)
+        }
+      }
+    }
+  '
+}
+
 build_and_launch() {
-  local worktree="$1" kind="$2" udid="$3" display="$4" clean="$5" launch="$6" logs="$7"
+  local worktree="$1" kind="$2" udid="$3" display="$4" clean="$5" launch="$6" logs="$7" verbose_logs="$8"
   local slug derived dest_arg lock_dir
   slug=$(worktree_slug "$worktree")
   derived="$CACHE_DIR/build/$slug/DerivedData"
@@ -532,65 +654,12 @@ build_and_launch() {
     return 0
   fi
 
-  info "launching ${BUNDLE_ID}…"
-  launch_app "$kind" "$udid"
-  ok "running on $display"
-
   if [[ "$logs" == "1" ]]; then
-    if [[ "$kind" == "sim" ]]; then
-      stream_logs_sim "$udid"
-    else
-      stream_logs_dev "$udid"
-    fi
-  fi
-}
-
-stream_logs_sim() {
-  local udid="$1"
-  printf "%s── logs ──%s\n" "$c_bold" "$c_reset"
-  ok "streaming logs from $PRODUCT_NAME (Ctrl-C to stop)"
-  trap 'echo; warn "stopped streaming (app keeps running on simulator)"; exit 0' INT
-  xcrun simctl spawn "$udid" log stream \
-    --style compact \
-    --process "$PRODUCT_NAME" \
-    --level debug || true
-  trap - INT
-}
-
-device_hw_udid() {
-  local devicectl_id="$1" json out
-  json=$(_devicectl_json) || return 1
-  out=$(echo "$json" | jq -r --arg id "$devicectl_id" '
-    (.result.devices // [])[]
-    | select(.identifier == $id)
-    | .hardwareProperties.udid
-  ' 2>/dev/null)
-  [[ -n "$out" && "$out" != "null" ]] && echo "$out"
-}
-
-stream_logs_dev() {
-  local devicectl_id="$1" hw_udid
-  printf "%s── logs ──%s\n" "$c_bold" "$c_reset"
-
-  if command -v idevicesyslog >/dev/null 2>&1; then
-    hw_udid=$(device_hw_udid "$devicectl_id") || true
-    ok "streaming logs from $PRODUCT_NAME via idevicesyslog (Ctrl-C to stop)"
-    trap 'echo; warn "stopped streaming (app keeps running on device)"; exit 0' INT
-    if [[ -n "$hw_udid" ]]; then
-      idevicesyslog -u "$hw_udid" --process "$PRODUCT_NAME" --no-kernel || true
-    else
-      warn "couldn't resolve hardware UDID; using first connected device"
-      idevicesyslog --process "$PRODUCT_NAME" --no-kernel || true
-    fi
-    trap - INT
+    launch_app_console "$kind" "$udid" "$verbose_logs"
   else
-    warn "for full device logs (Logger / os_log / NSLog), install:"
-    printf "    brew install libimobiledevice\n"
-    warn "falling back to devicectl --console (print/stdout only)…"
-    ok "streaming console (Ctrl-C to stop)"
-    trap 'echo; warn "stopped streaming (app may also terminate on device)"; exit 0' INT
-    xcrun devicectl device process launch --console --device "$devicectl_id" "$BUNDLE_ID" || true
-    trap - INT
+    info "launching ${BUNDLE_ID}…"
+    launch_app "$kind" "$udid"
+    ok "running on $display"
   fi
 }
 
@@ -978,10 +1047,10 @@ doctor() {
     _row_hint "brew install xcbeautify"
   fi
   if command -v idevicesyslog >/dev/null 2>&1; then
-    _row_ok "idevicesyslog (libimobiledevice) — full device log streaming"
+    _row_ok "idevicesyslog (libimobiledevice) — Xcode-style physical-device logs"
   else
     _row_warn "idevicesyslog — not installed"
-    _row_hint "without it, 'gleis -l' on physical devices only sees print()/stdout."
+    _row_hint "without it, 'gleis -l' on physical devices falls back to stdout/stderr only"
     _row_hint "install with: brew install libimobiledevice"
   fi
 
@@ -1154,12 +1223,12 @@ doctor() {
 # ─── main ────────────────────────────────────────────────────────────────────
 
 usage() {
-  sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 
 main() {
-  local mode="pick" preselect="" clean=0 launch=1 logs=0
+  local mode="pick" preselect="" clean=0 launch=1 logs=0 verbose_logs=0
 
   while (( $# )); do
     case "$1" in
@@ -1169,6 +1238,7 @@ main() {
       -d|--destination) mode="dest" ;;
       -w|--worktree)    mode="wt" ;;
       -l|--logs)        logs=1 ;;
+      --verbose-logs)   verbose_logs=1 ;;
       --clean)          clean=1 ;;
       --no-launch)      launch=0 ;;
       -*)               die "unknown flag: $1" ;;
@@ -1208,7 +1278,7 @@ main() {
   esac
 
   save_state "$state_file" "$worktree" "$kind" "$udid" "$display"
-  build_and_launch "$worktree" "$kind" "$udid" "$display" "$clean" "$launch" "$logs"
+  build_and_launch "$worktree" "$kind" "$udid" "$display" "$clean" "$launch" "$logs" "$verbose_logs"
 }
 
 if [[ -n "${GLEIS_INIT_MODE:-}" ]]; then

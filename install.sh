@@ -49,7 +49,7 @@ if (( ${#missing[@]} )); then
   warn "install with: brew install ${missing[*]}"
 fi
 command -v xcbeautify     >/dev/null 2>&1 || warn "optional: brew install xcbeautify (prettier build output)"
-command -v idevicesyslog  >/dev/null 2>&1 || warn "optional: brew install libimobiledevice (device os_log streaming)"
+command -v idevicesyslog  >/dev/null 2>&1 || warn "recommended: brew install libimobiledevice (Xcode-style device logs)"
 
 echo
 ok "gleis $($SCRIPT --version | awk '{print $2}') installed."

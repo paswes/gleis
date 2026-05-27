@@ -2,6 +2,44 @@
 
 All notable changes to gleis.
 
+## [1.1.6] — 2026-05-27
+
+### Changed
+
+- Focused physical-device logs now keep only app/app-debug-dylib messages,
+  strip the raw `idevicesyslog` prefix, and hide framework/network chatter.
+  Use `--verbose-logs` to see the raw stream.
+
+## [1.1.5] — 2026-05-27
+
+### Added
+
+- `gleis --verbose-logs` preserves the raw physical-device log stream when
+  combined with `--logs`.
+
+### Changed
+
+- Physical-device `gleis -l` now filters common framework startup noise by
+  default while keeping app/request logs visible.
+
+## [1.1.4] — 2026-05-27
+
+### Fixed
+
+- Physical-device `gleis -l` now starts `idevicesyslog` before launching the
+  app, so Xcode-style device console output is captured from startup instead
+  of only attaching stdout/stderr through `devicectl --console`.
+
+## [1.1.3] — 2026-05-27
+
+### Fixed
+
+- `gleis -l, --logs` now launches with the app console attached on both
+  simulators and physical devices, so launch-time stdout/stderr output is
+  captured the same way Xcode's debug console captures it.
+- Physical-device console logging no longer launches the app once and then
+  tries to attach afterward, which could miss startup output.
+
 ## [1.1.2] — 2026-05-27
 
 ### Changed
@@ -63,11 +101,7 @@ Initial release.
   and BUNDLE_ID from the Xcode project
 - `gleis doctor` — diagnose dependencies, Xcode setup, current project's
   config, and connected iOS destinations
-- `gleis -l, --logs` — stream app logs after launch
-  - Simulator: full unified logging via `simctl log stream` (catches
-    print, NSLog, os_log/Logger)
-  - Device: full unified log via `idevicesyslog` when installed; falls
-    back to `devicectl --console` for print/stdout only
+- `gleis -l, --logs` — launch with the app console attached
 - `gleis --clean` — wipe per-worktree DerivedData before building
 - `gleis --no-launch` — build + install without launching
 - Branch fuzzy-match (`gleis polish` preselects a worktree)
