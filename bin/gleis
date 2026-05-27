@@ -523,7 +523,7 @@ build_and_launch() {
 
   prepare_destination "$kind" "$udid"
 
-  info "installing $PRODUCT_NAME…"
+  info "installing ${PRODUCT_NAME}…"
   install_app "$kind" "$udid" "$app_path"
   if [[ "$launch" != "1" ]]; then
     ok "installed on $display (skipped launch)"
