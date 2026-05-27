@@ -2,6 +2,15 @@
 
 All notable changes to gleis.
 
+## [1.1.2] — 2026-05-27
+
+### Changed
+
+- Clarified help and README wording for worktree substring matching, replacing
+  the confusing `polish` example with generic branch/path matching examples.
+- Documented the difference between `--clean`, `prune`, `prune --all`, and
+  uninstall purge cleanup.
+
 ## [1.1.1] — 2026-05-27
 
 ### Changed

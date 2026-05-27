@@ -7,19 +7,21 @@
 #   gleis --last                  rebuild last worktree on last destination
 #   gleis -d, --destination       keep last worktree, pick a new destination
 #   gleis -w, --worktree          keep last destination, pick a new worktree
-#   gleis <branch-substring>      preselect worktree by branch fuzzy-match
+#   gleis <text>                  match worktree path/branch, then pick destination
 #   gleis -l, --logs              stream app logs after launch (Ctrl-C to stop)
 #   gleis --no-launch             build + install only, don't launch
-#   gleis --clean                 wipe THIS worktree's DerivedData, then build
+#   gleis --clean                 clean rebuild: wipe selected worktree's DerivedData
 #   gleis init                    create .gleis.conf for the current project
 #   gleis doctor                  diagnose your gleis setup
-#   gleis prune [--all]           reclaim build-cache disk from deleted worktrees
+#   gleis prune                   remove build caches for deleted worktrees
+#   gleis prune --all             clear all gleis build caches
 #   gleis --version               print version
 #
 # Examples:
 #   gleis                         first run: pick a worktree, then a destination
 #   gleis --last                  fastest inner loop: repeat the last build
-#   gleis polish -l               build the 'polish' worktree, then stream logs
+#   gleis login                   match branch/path containing "login"
+#   gleis login -w                match "login", reuse the last destination
 #
 # Requires: fzf, jq, xcodebuild, xcrun  (xcbeautify optional, used if present)
 #
@@ -42,7 +44,7 @@
 #                    (default: same as SCHEME)
 #     LOCAL_FILES  — array of gitignored files to auto-copy across worktrees
 
-readonly GLEIS_VERSION="1.1.1"
+readonly GLEIS_VERSION="1.1.2"
 
 set -euo pipefail
 
@@ -74,7 +76,7 @@ require() {
 for arg in "$@"; do
   case "$arg" in
     -h|--help)
-      sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     --version)
@@ -1152,7 +1154,7 @@ doctor() {
 # ─── main ────────────────────────────────────────────────────────────────────
 
 usage() {
-  sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '3,26p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-0}"
 }
 

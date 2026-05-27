@@ -97,23 +97,42 @@ gleis                       interactive: pick worktree, then destination
 gleis --last                rebuild last worktree on last destination
 gleis -d, --destination     keep last worktree, pick a new destination
 gleis -w, --worktree        keep last destination, pick a new worktree
-gleis <branch-substring>    preselect worktree by branch fuzzy-match
+gleis <text>                match worktree path/branch, then pick destination
 gleis -l, --logs            stream app logs after launch (Ctrl-C to stop)
 gleis --no-launch           build + install only, don't launch
-gleis --clean               wipe THIS worktree's DerivedData, then build
+gleis --clean               clean rebuild: wipe selected worktree's DerivedData
 gleis init                  create .gleis.conf for the current project
 gleis doctor                diagnose your gleis setup
-gleis prune [--all]         reclaim build-cache disk from deleted worktrees
+gleis prune                 remove build caches for deleted worktrees
+gleis prune --all           clear all gleis build caches
 gleis --version             print version
 gleis -h, --help            show usage
 ```
 
-The four navigation modes form a clean 2×2:
+Worktree matching is not a separate command. Any plain argument is treated as a
+search string for the worktree path or branch. For example, `gleis login`
+matches a worktree whose branch/path contains `login`, then asks for a
+destination. Use it when you already know which worktree you want and want to
+skip the worktree picker.
+
+The four navigation modes choose what to pick versus reuse:
 
 |                    | pick destination | reuse destination |
 |--------------------|------------------|-------------------|
 | **pick worktree**  | `gleis`             | `gleis -w`           |
 | **reuse worktree** | `gleis -d`          | `gleis --last`       |
+
+You can combine worktree matching with `-w`: `gleis login -w` matches a
+`login` worktree and reuses the last destination.
+
+Cleanup commands have different scopes:
+
+| Command | What it removes | When to use it |
+|---------|-----------------|----------------|
+| `gleis --clean --last` | DerivedData for the selected/last worktree, then rebuilds | Current build seems stale or broken |
+| `gleis prune` | Build caches for worktrees that no longer exist | After deleting git worktrees |
+| `gleis prune --all` | All gleis build caches | Reclaim disk or force every worktree to rebuild fresh |
+| `./uninstall.sh --purge` | The installed symlink plus gleis configs/cache | Full uninstall only |
 
 ## How it works
 
@@ -134,7 +153,7 @@ The four navigation modes form a clean 2×2:
 
 State is per-repo, so `gleis --last` in one project doesn't get confused by another. The `<hash>` keys the path, so two repos that happen to share a name don't collide.
 
-Per-worktree build caches accumulate as you create and delete worktrees. Run `gleis prune` to drop caches whose worktree no longer exists (or `gleis prune --all` to clear them all); `gleis doctor` reports the current cache size.
+Per-worktree build caches accumulate as you create and delete worktrees. Run `gleis prune` to drop caches whose worktree no longer exists, or `gleis prune --all` to clear every gleis build cache. `gleis doctor` reports the current cache size.
 
 ## Updating
 
