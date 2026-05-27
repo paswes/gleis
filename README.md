@@ -152,7 +152,13 @@ cd ~/Developer/tools/gleis
 ./uninstall.sh
 ```
 
-Removes the symlink. Repo, configs, and caches are left intact — delete them manually if you want.
+Removes the symlink, then asks whether to remove configs and caches too. The
+safe default keeps them, so reinstalling later can reuse your setup. To remove
+everything without a prompt:
+
+```sh
+./uninstall.sh --purge
+```
 
 ## Troubleshooting
 

@@ -2,6 +2,13 @@
 
 All notable changes to gleis.
 
+## [1.1.1] — 2026-05-27
+
+### Changed
+
+- `uninstall.sh` now asks whether to remove gleis configs/cache, and supports
+  `--all` / `--purge` for explicit full cleanup.
+
 ## [1.1.0] — 2026-05-27
 
 ### Added

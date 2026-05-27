@@ -42,7 +42,7 @@
 #                    (default: same as SCHEME)
 #     LOCAL_FILES  — array of gitignored files to auto-copy across worktrees
 
-readonly GLEIS_VERSION="1.1.0"
+readonly GLEIS_VERSION="1.1.1"
 
 set -euo pipefail
 
