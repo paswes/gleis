@@ -289,13 +289,19 @@ list_simulators() {
     }'
 }
 
-list_devices() {
-  local tmp json
-  tmp=$(mktemp) || return 0
+# Echo `devicectl list devices` as JSON, or nothing (nonzero) on failure.
+# Always via a real temp file — devicectl corrupts JSON written to /dev/stdout.
+_devicectl_json() {
+  local tmp
+  tmp=$(mktemp) || return 1
   trap 'rm -f "$tmp"' RETURN
-  xcrun devicectl list devices --json-output "$tmp" >/dev/null 2>&1 \
-    || return 0
-  json=$(cat "$tmp")
+  xcrun devicectl list devices --json-output "$tmp" >/dev/null 2>&1 || return 1
+  cat "$tmp"
+}
+
+list_devices() {
+  local json
+  json=$(_devicectl_json) || return 0
   echo "$json" | jq -r '
     (.result.devices // [])[]
     | select(.connectionProperties.tunnelState == "connected")
@@ -535,12 +541,8 @@ stream_logs_sim() {
 }
 
 device_hw_udid() {
-  local devicectl_id="$1" tmp json out
-  tmp=$(mktemp) || return 1
-  trap 'rm -f "$tmp"' RETURN
-  xcrun devicectl list devices --json-output "$tmp" >/dev/null 2>&1 \
-    || return 1
-  json=$(cat "$tmp")
+  local devicectl_id="$1" json out
+  json=$(_devicectl_json) || return 1
   out=$(echo "$json" | jq -r --arg id "$devicectl_id" '
     (.result.devices // [])[]
     | select(.identifier == $id)
@@ -900,9 +902,14 @@ doctor() {
   _section "cache"
   if [[ -d "$CACHE_DIR" ]]; then
     if [[ -w "$CACHE_DIR" ]]; then
-      local size
+      local size build_size
       size=$(du -sh "$CACHE_DIR" 2>/dev/null | awk '{print $1}')
       _row_ok "$CACHE_DIR (${size:-unknown size})"
+      if [[ -d "$CACHE_DIR/build" ]]; then
+        build_size=$(du -sh "$CACHE_DIR/build" 2>/dev/null | awk '{print $1}')
+        _row_ok "build cache: ${build_size:-unknown size}"
+        _row_hint "reclaim space from deleted worktrees with: gleis prune"
+      fi
     else
       _row_err "$CACHE_DIR exists but is not writable"
       _row_hint "chmod u+w $CACHE_DIR"
@@ -963,35 +970,72 @@ doctor() {
     fi
   fi
 
-  _section "destinations"
-  local sim_count dev_count
-  if command -v xcrun >/dev/null 2>&1; then
-    sim_count=$(xcrun simctl list devices --json available 2>/dev/null \
-      | jq '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.isAvailable == true)] | length' 2>/dev/null \
-      || echo 0)
-    _row_ok "$sim_count iOS simulator(s) available"
+  # Informational from here down — these never set fail.
+  _section "worktrees"
+  if [[ -z "$repo" ]]; then
+    _row_warn "not in a repo — skipping"
+  elif [[ -z "${PROJECT:-}" ]]; then
+    _row_warn "no usable config — can't tell which worktrees match"
+  else
+    local wt_rows wt_count
+    wt_rows=$(_worktrees_with_project "$repo" "$PROJECT" 2>/dev/null || true)
+    if [[ -n "$wt_rows" ]]; then
+      wt_count=$(printf '%s\n' "$wt_rows" | grep -c .)
+      _row_ok "$wt_count worktree(s) contain $PROJECT"
+      printf '%s\n' "$wt_rows" | awk -F'\t' '{printf "      %s  (%s)\n", $2, $1}'
+    else
+      _row_warn "no worktrees contain $PROJECT"
+      _row_hint "add one with: git worktree add <path> <branch>"
+    fi
+  fi
 
-    local dtmp
-    dtmp=$(mktemp) || dtmp=""
-    if [[ -n "$dtmp" ]] && xcrun devicectl list devices --json-output "$dtmp" >/dev/null 2>&1; then
-      dev_count=$(jq '[.result.devices // [] | .[] | select(.connectionProperties.tunnelState == "connected") | select((.hardwareProperties.platform // "") == "iOS")] | length' < "$dtmp" 2>/dev/null || echo 0)
-      if [[ "$dev_count" -gt 0 ]]; then
+  _section "last run"
+  if [[ -z "$repo" ]]; then
+    _row_warn "not in a repo — skipping"
+  else
+    local sf last_line last_wt last_disp
+    sf=$(state_file_for_repo "$repo")
+    if [[ -f "$sf" ]]; then
+      # Read in a subshell so LAST_* don't leak into doctor's scope.
+      last_line=$( # shellcheck disable=SC1090
+        source "$sf" 2>/dev/null; printf '%s\t%s' "${LAST_WORKTREE:-}" "${LAST_DISPLAY:-}")
+      IFS=$'\t' read -r last_wt last_disp <<<"$last_line"
+      _row_ok "worktree:    $(basename "${last_wt:-?}")"
+      _row_ok "destination: ${last_disp:-?}"
+      _row_hint "repeat it with: gleis --last"
+    else
+      _row_ok "none yet — run 'gleis' once to remember a worktree + destination"
+    fi
+  fi
+
+  _section "destinations"
+  local sim_count booted_count dev_count sim_json dev_json
+  if command -v xcrun >/dev/null 2>&1; then
+    sim_json=$(xcrun simctl list devices --json available 2>/dev/null || true)
+    sim_count=$(printf '%s' "$sim_json" | jq '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.isAvailable == true)] | length' 2>/dev/null || echo 0)
+    booted_count=$(printf '%s' "$sim_json" | jq '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.isAvailable == true) | select(.state == "Booted")] | length' 2>/dev/null || echo 0)
+    _row_ok "$sim_count iOS simulator(s) available"
+    if [[ "${booted_count:-0}" -gt 0 ]]; then
+      _row_ok "$booted_count already booted (fastest to build to)"
+    fi
+
+    if dev_json=$(_devicectl_json); then
+      dev_count=$(printf '%s' "$dev_json" | jq '[.result.devices // [] | .[] | select(.connectionProperties.tunnelState == "connected") | select((.hardwareProperties.platform // "") == "iOS")] | length' 2>/dev/null || echo 0)
+      if [[ "${dev_count:-0}" -gt 0 ]]; then
         _row_ok "$dev_count physical device(s) connected"
-        jq -r '
+        printf '%s' "$dev_json" | jq -r '
           (.result.devices // [])[]
           | select(.connectionProperties.tunnelState == "connected")
           | select((.hardwareProperties.platform // "") == "iOS")
           | "      — \(.deviceProperties.name) (iOS \(.deviceProperties.osVersionNumber), \(.connectionProperties.transportType))"
-        ' < "$dtmp" 2>/dev/null
+        ' 2>/dev/null
       else
         _row_warn "no physical iOS devices connected"
         _row_hint "plug in an iPhone, unlock it, and trust this Mac"
         _row_hint "ensure Developer Mode is on (Settings → Privacy & Security → Developer Mode)"
       fi
-      rm -f "$dtmp"
     else
       _row_warn "devicectl unavailable — can't enumerate physical devices"
-      [[ -n "$dtmp" ]] && rm -f "$dtmp"
     fi
   else
     _row_err "xcrun not available; cannot probe destinations"
