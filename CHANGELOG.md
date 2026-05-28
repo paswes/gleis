@@ -2,6 +2,24 @@
 
 All notable changes to gleis.
 
+## [1.2.1] — 2026-05-28
+
+### Changed
+
+- `gleis doctor` and `gleis ship` now remain as compatibility aliases for
+  `gleis wartung` and `gleis abfahrt`, with a warning instead of a hard error.
+- Worktree substring matches now ask when multiple worktrees match instead of
+  silently choosing the first match.
+- `gleis wartung` now reports simulator service failures clearly instead of
+  printing a blank simulator count.
+
+### Fixed
+
+- `--last`, `-d`, and `-w` now validate saved worktrees/destinations before
+  building, and point to the picker command that refreshes stale state.
+- Generated abfahrt install pages and OTA manifests now escape XML/HTML-sensitive
+  values from project config.
+
 ## [1.2.0] — 2026-05-28
 
 ### Added

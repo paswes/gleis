@@ -152,11 +152,15 @@ gleis --version             print version
 gleis -h, --help            show usage
 ```
 
+Legacy names still work with a warning: `gleis doctor` runs `gleis wartung`,
+and `gleis ship` runs `gleis abfahrt`.
+
 Worktree matching is not a separate command. Any plain argument is treated as a
 search string for the worktree path or branch. For example, `gleis login`
 matches a worktree whose branch/path contains `login`, then asks for a
-destination. Use it when you already know which worktree you want and want to
-skip the worktree picker.
+destination. If more than one worktree matches, gleis opens the picker scoped to
+those matches instead of guessing. Use it when you already know which worktree
+you want and want to skip the full worktree list.
 
 The four navigation modes choose what to pick versus reuse:
 

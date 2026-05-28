@@ -48,7 +48,7 @@
 #     LOCAL_FILES  — array of gitignored files to auto-copy across worktrees
 #     TEAM_ID / SHIP_DOMAIN / VERCEL_PROJECT — required only for `gleis abfahrt`
 
-readonly GLEIS_VERSION="1.2.0"
+readonly GLEIS_VERSION="1.2.1"
 
 set -euo pipefail
 
@@ -95,6 +95,21 @@ require_ship_tools() {
   $(printf '%s\n  ' "${hints[@]}")"
 }
 
+# Compatibility aliases for the 1.2.0 command rename. Keep the new names
+# canonical, but don't break muscle memory for users who upgraded in place.
+case "${1:-}" in
+  ship)
+    warn "'gleis ship' was renamed to 'gleis abfahrt'; running 'gleis abfahrt' instead"
+    shift
+    set -- abfahrt "$@"
+    ;;
+  doctor)
+    warn "'gleis doctor' was renamed to 'gleis wartung'; running 'gleis wartung' instead"
+    shift
+    set -- wartung "$@"
+    ;;
+esac
+
 # Early-exit for --help / --version so they work without dependencies
 for arg in "$@"; do
   case "$arg" in
@@ -105,12 +120,6 @@ for arg in "$@"; do
     --version)
       echo "gleis $GLEIS_VERSION"
       exit 0
-      ;;
-    ship)
-      die "'gleis ship' was renamed to 'gleis abfahrt'"
-      ;;
-    doctor)
-      die "'gleis doctor' was renamed to 'gleis wartung'"
       ;;
     wartung)
       # `wartung` runs without requiring deps — it diagnoses what's missing.
@@ -301,7 +310,7 @@ list_worktrees() {
 
 # Echoes selected worktree path
 select_worktree() {
-  local preselect="${1:-}" rows choice
+  local preselect="${1:-}" rows matches choice match_count
 
   rows=$(list_worktrees)
   [[ -n "$rows" ]] || die "no worktrees contain $PROJECT
@@ -310,12 +319,28 @@ select_worktree() {
   - add one with: git worktree add <path> <branch>"
 
   if [[ -n "$preselect" ]]; then
-    choice=$(echo "$rows" | awk -F'\t' -v q="$preselect" '
+    matches=$(echo "$rows" | awk -F'\t' -v q="$preselect" '
       tolower($2) ~ tolower(q) || tolower($1) ~ tolower(q)
-    ' | head -1)
-    [[ -n "$choice" ]] || die "no worktree matches '$preselect'. Available:
+    ')
+    [[ -n "$matches" ]] || die "no worktree matches '$preselect'. Available:
 $(echo "$rows" | awk -F'\t' '{printf "    %s\n", $2}')
   retry with a more specific substring, or run 'gleis' to pick interactively"
+    match_count=$(printf '%s\n' "$matches" | grep -c .)
+    if (( match_count == 1 )); then
+      choice="$matches"
+    elif [[ -r /dev/tty && -w /dev/tty ]]; then
+      choice=$(printf '%s\n' "$matches" | fzf \
+        --prompt="worktree ❯ " \
+        --delimiter=$'\t' \
+        --with-nth=2,1 \
+        --header="multiple worktrees match '$preselect'" \
+        --height=40% --reverse --no-multi) \
+        || die "no worktree selected"
+    else
+      die "multiple worktrees match '$preselect':
+$(printf '%s\n' "$matches" | awk -F'\t' '{printf "    %s  (%s)\n", $2, $1}')
+  retry with a more specific substring, or run 'gleis' interactively"
+    fi
   else
     choice=$(echo "$rows" | fzf \
       --prompt="worktree ❯ " \
@@ -732,7 +757,28 @@ load_state() {
   [[ -f "$state_file" ]] || return 1
   # shellcheck disable=SC1090
   source "$state_file"
-  [[ -n "${LAST_WORKTREE:-}" && -d "$LAST_WORKTREE" ]]
+  [[ -n "${LAST_WORKTREE:-}" && -n "${LAST_KIND:-}" && -n "${LAST_UDID:-}" && -n "${LAST_DISPLAY:-}" ]]
+}
+
+validate_saved_worktree() {
+  local recovery="$1"
+  [[ -d "${LAST_WORKTREE:-}" ]] || die "saved worktree no longer exists: ${LAST_WORKTREE:-<missing>}
+  pick a current worktree with: $recovery"
+  [[ -e "$LAST_WORKTREE/$PROJECT" ]] || die "saved worktree no longer contains $PROJECT: $LAST_WORKTREE
+  pick a current worktree with: $recovery"
+}
+
+validate_saved_destination() {
+  local recovery="$1" rows
+  rows=$( { list_devices; list_simulators; } )
+  [[ -n "$rows" ]] || die "saved destination can't be validated because no destinations are available
+  pick a destination after connecting/booting one with: $recovery
+  or inspect setup with: gleis wartung"
+  printf '%s\n' "$rows" | awk -F'\t' -v kind="$LAST_KIND" -v udid="$LAST_UDID" '
+    $1 == kind && $2 == udid { found=1 }
+    END { exit found ? 0 : 1 }
+  ' || die "saved destination is no longer available: ${LAST_DISPLAY:-$LAST_UDID}
+  pick a current destination with: $recovery"
 }
 
 # Ship state lives in a sibling file to the build/launch state so the two never
@@ -1167,6 +1213,20 @@ run_ship_xcode() {
   fi
 }
 
+xml_escape() {
+  local s="$1"
+  s=${s//&/&amp;}
+  s=${s//</&lt;}
+  s=${s//>/&gt;}
+  s=${s//\"/&quot;}
+  s=${s//\'/&apos;}
+  printf '%s' "$s"
+}
+
+html_escape() {
+  xml_escape "$1"
+}
+
 # `gleis abfahrt` — build the current worktree into a signed ad-hoc .ipa, generate
 # an OTA manifest, deploy to Vercel, print an install URL.
 abfahrt() {
@@ -1235,6 +1295,8 @@ abfahrt() {
   echo
   local buildnum lock_dir archive_path export_dir deploy_dir
   local market_version ipa deploy_url install_url
+  local ipa_url manifest_url escaped_ipa_url escaped_manifest_url
+  local escaped_bundle_id escaped_buildnum escaped_ship_title escaped_html_title
   buildnum=$(date +%s)
   archive_path="$ship_dir/$PRODUCT_NAME.xcarchive"
   export_dir="$ship_dir/export"
@@ -1337,6 +1399,15 @@ EOF
   info "staging deploy → $deploy_dir"
   cp "$ipa" "$deploy_dir/$PRODUCT_NAME.ipa"
 
+  ipa_url="https://$SHIP_DOMAIN/$PRODUCT_NAME.ipa"
+  manifest_url="https://$SHIP_DOMAIN/manifest.plist"
+  escaped_ipa_url=$(xml_escape "$ipa_url")
+  escaped_manifest_url=$(html_escape "$manifest_url")
+  escaped_bundle_id=$(xml_escape "$BUNDLE_ID")
+  escaped_buildnum=$(xml_escape "$buildnum")
+  escaped_ship_title=$(xml_escape "$SHIP_TITLE")
+  escaped_html_title=$(html_escape "$SHIP_TITLE")
+
   cat > "$deploy_dir/manifest.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1349,15 +1420,15 @@ EOF
       <array>
         <dict>
           <key>kind</key><string>software-package</string>
-          <key>url</key><string>https://$SHIP_DOMAIN/$PRODUCT_NAME.ipa</string>
+          <key>url</key><string>$escaped_ipa_url</string>
         </dict>
       </array>
       <key>metadata</key>
       <dict>
-        <key>bundle-identifier</key><string>$BUNDLE_ID</string>
-        <key>bundle-version</key><string>$buildnum</string>
+        <key>bundle-identifier</key><string>$escaped_bundle_id</string>
+        <key>bundle-version</key><string>$escaped_buildnum</string>
         <key>kind</key><string>software</string>
-        <key>title</key><string>$SHIP_TITLE</string>
+        <key>title</key><string>$escaped_ship_title</string>
       </dict>
     </dict>
   </array>
@@ -1371,7 +1442,7 @@ EOF
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Install $SHIP_TITLE</title>
+  <title>Install $escaped_html_title</title>
   <style>
     body { font-family: -apple-system, system-ui, sans-serif; margin: 0; min-height: 100vh;
            display: flex; align-items: center; justify-content: center; background: #f2f2f7; color: #1c1c1e; }
@@ -1384,9 +1455,9 @@ EOF
 </head>
 <body>
   <div class="card">
-    <h1>$SHIP_TITLE</h1>
+    <h1>$escaped_html_title</h1>
     <p>Build $buildnum</p>
-    <a class="btn" href="itms-services://?action=download-manifest&amp;url=https://$SHIP_DOMAIN/manifest.plist">Install $SHIP_TITLE</a>
+    <a class="btn" href="itms-services://?action=download-manifest&amp;url=$escaped_manifest_url">Install $escaped_html_title</a>
   </div>
 </body>
 </html>
@@ -1735,15 +1806,27 @@ wartung() {
   fi
 
   _section "destinations"
-  local sim_count booted_count dev_count sim_json dev_json
+  local sim_count booted_count dev_count sim_json sim_err dev_json
   if command -v xcrun >/dev/null 2>&1; then
-    sim_json=$(xcrun simctl list devices --json available 2>/dev/null || true)
-    sim_count=$(printf '%s' "$sim_json" | jq '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.isAvailable == true)] | length' 2>/dev/null || echo 0)
-    booted_count=$(printf '%s' "$sim_json" | jq '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.isAvailable == true) | select(.state == "Booted")] | length' 2>/dev/null || echo 0)
-    _row_ok "$sim_count iOS simulator(s) available"
-    if [[ "${booted_count:-0}" -gt 0 ]]; then
-      _row_ok "$booted_count already booted (fastest to build to)"
+    sim_err=$(mktemp)
+    if sim_json=$(xcrun simctl list devices --json available 2>"$sim_err") \
+       && jq -e '.devices' >/dev/null 2>&1 <<<"$sim_json"; then
+      sim_count=$(printf '%s' "$sim_json" | jq -r '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.isAvailable == true)] | length' 2>/dev/null || echo 0)
+      booted_count=$(printf '%s' "$sim_json" | jq -r '[.devices | to_entries[] | select(.key | test("iOS")) | .value[] | select(.isAvailable == true) | select(.state == "Booted")] | length' 2>/dev/null || echo 0)
+      sim_count=${sim_count:-0}
+      booted_count=${booted_count:-0}
+      _row_ok "$sim_count iOS simulator(s) available"
+      if [[ "$booted_count" -gt 0 ]]; then
+        _row_ok "$booted_count already booted (fastest to build to)"
+      fi
+    else
+      _row_warn "simctl unavailable — can't enumerate simulators"
+      local sim_reason
+      sim_reason=$(grep -m1 -E '[^[:space:]]' "$sim_err" 2>/dev/null || true)
+      [[ -n "$sim_reason" ]] && _row_hint "$sim_reason"
+      _row_hint "try opening Simulator.app, or run: xcrun simctl list devices"
     fi
+    rm -f "$sim_err"
 
     if dev_json=$(_devicectl_json); then
       dev_count=$(printf '%s' "$dev_json" | jq '[.result.devices // [] | .[] | select(.connectionProperties.tunnelState == "connected") | select((.hardwareProperties.platform // "") == "iOS")] | length' 2>/dev/null || echo 0)
@@ -1812,17 +1895,21 @@ main() {
   case "$mode" in
     last)
       load_state "$state_file" || die "no saved state for this repo — run 'gleis' once first"
+      validate_saved_worktree "gleis"
+      validate_saved_destination "gleis -d"
       worktree="$LAST_WORKTREE" kind="$LAST_KIND"
       udid="$LAST_UDID"         display="$LAST_DISPLAY"
       ;;
     dest)
       load_state "$state_file" || die "no saved state for this repo — run 'gleis' once first"
+      validate_saved_worktree "gleis -w"
       worktree="$LAST_WORKTREE"
       row=$(select_destination)
       IFS=$'\t' read -r kind udid display <<<"$row"
       ;;
     wt)
       load_state "$state_file" || die "no saved state for this repo — run 'gleis' once first"
+      validate_saved_destination "gleis -d"
       kind="$LAST_KIND" udid="$LAST_UDID" display="$LAST_DISPLAY"
       worktree=$(select_worktree "$preselect")
       ;;
