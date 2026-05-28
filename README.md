@@ -118,9 +118,22 @@ Optional abfahrt config:
 SHIP_CONFIG="Release"
 SHIP_METHOD="release-testing"
 SHIP_SIGNING="automatic"
+SHIP_KEYCHAIN="~/Library/Keychains/login.keychain-db"
 SHIP_TITLE="MyApp"
 EXPORT_OPTIONS="ExportOptions.plist"
 ```
+
+By default, macOS may show its normal codesign keychain password dialog during
+archive/export. To grant Apple signing tools persistent access once, run:
+
+```sh
+gleis abfahrt setup-keychain
+```
+
+gleis asks for the keychain password in the terminal, unlocks `SHIP_KEYCHAIN`,
+and updates the keychain access list. It does not store the password. Future
+`gleis abfahrt` runs should then continue without the macOS codesign password
+window as long as the keychain is already unlocked in your login session.
 
 On the first run, `gleis abfahrt` creates a per-project deploy folder under
 `~/Library/Caches/gleis/ship/`, writes a static `vercel.json` if needed, and
@@ -145,6 +158,8 @@ gleis --clean               clean rebuild: wipe selected worktree's DerivedData
 gleis init                  create .gleis.conf for the current project
 gleis abfahrt init          add OTA shipping settings to .gleis.conf
 gleis abfahrt               archive, export, deploy, print install URL
+gleis abfahrt setup-keychain
+                            allow codesign to use the signing key
 gleis wartung               diagnose your gleis setup
 gleis prune                 remove build caches for deleted worktrees
 gleis prune --all           clear all gleis build caches
