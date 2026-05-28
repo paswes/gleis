@@ -13,6 +13,8 @@
 #   gleis --no-launch             build + install only, don't launch
 #   gleis --clean                 clean rebuild: wipe selected worktree's DerivedData
 #   gleis init                    create .gleis.conf for the current project
+#   gleis ship init               add OTA shipping settings to .gleis.conf
+#   gleis ship                    archive, export, deploy, and print install URL
 #   gleis doctor                  diagnose your gleis setup
 #   gleis prune                   remove build caches for deleted worktrees
 #   gleis prune --all             clear all gleis build caches
@@ -44,8 +46,9 @@
 #     PRODUCT_NAME — the .app filename if it differs from SCHEME
 #                    (default: same as SCHEME)
 #     LOCAL_FILES  — array of gitignored files to auto-copy across worktrees
+#     TEAM_ID / SHIP_DOMAIN / VERCEL_PROJECT — required only for `gleis ship`
 
-readonly GLEIS_VERSION="1.1.6"
+readonly GLEIS_VERSION="1.2.0"
 
 set -euo pipefail
 
@@ -71,6 +74,25 @@ require() {
   if (( ${#missing[@]} )); then
     die "missing: ${missing[*]} — install with: brew install ${missing[*]}"
   fi
+}
+
+require_ship_tools() {
+  local missing=() cmd
+  for cmd in jq xcodebuild vercel; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+  (( ${#missing[@]} == 0 )) && return 0
+
+  local hints=()
+  for cmd in "${missing[@]}"; do
+    case "$cmd" in
+      jq)         hints+=("brew install jq") ;;
+      xcodebuild) hints+=("install full Xcode, then run: sudo xcode-select -s /Applications/Xcode.app") ;;
+      vercel)     hints+=("npm install -g vercel  # then: vercel login") ;;
+    esac
+  done
+  die "missing ship tool(s): ${missing[*]}
+  $(printf '%s\n  ' "${hints[@]}")"
 }
 
 # Early-exit for --help / --version so they work without dependencies
@@ -108,14 +130,15 @@ done
 # detected on $1 here rather than via the keyword scan above — otherwise
 # `gleis ship init` would trip the `init)` arm and run the project init. Like
 # the others, its implementation is deferred to the dispatch tail. Plain
-# `gleis ship` keeps the normal dep-check (it needs the build toolchain).
+# `gleis ship` has its own dep-check so it can require Vercel without making
+# the normal build/launch path depend on it.
 if [[ "${1:-}" == "ship" ]]; then
   GLEIS_SHIP_MODE=1
 fi
 
 # Required runtime tools — checked here for normal commands. doctor, init, and
 # prune bypass this (they work without a full build toolchain).
-if [[ -z "${GLEIS_DOCTOR_MODE:-}" && -z "${GLEIS_INIT_MODE:-}" && -z "${GLEIS_PRUNE_MODE:-}" ]]; then
+if [[ -z "${GLEIS_DOCTOR_MODE:-}" && -z "${GLEIS_INIT_MODE:-}" && -z "${GLEIS_PRUNE_MODE:-}" && -z "${GLEIS_SHIP_MODE:-}" ]]; then
   require fzf jq xcodebuild xcrun
 fi
 
@@ -712,7 +735,15 @@ ship_state_file_for_repo() {
   printf '%s.ship' "$(state_file_for_repo "$1")"
 }
 
-# Written by the (upcoming) deploy step; read here so `gleis ship` can show the
+# Ship deploy staging is per repo so two configured apps never overwrite each
+# other's manifest, IPA, Vercel link, or generated install page.
+ship_deploy_dir_for_repo() {
+  local repo="$1" slug
+  slug=$(worktree_slug "$repo")
+  printf '%s/ship/%s/deploy' "$CACHE_DIR" "$slug"
+}
+
+# Written after deploy; read before the next run so `gleis ship` can show the
 # previous install URL. Mirrors save_state/load_state's quoted, source-able form.
 save_ship_state() {
   local state_file="$1" version="$2" build="$3" url="$4"
@@ -958,9 +989,6 @@ init() {
 # a signed ad-hoc .ipa, writes an OTA install manifest, deploys both to Vercel,
 # and prints an install URL. Its extra config lives in the same .gleis.conf but
 # is validated only here, so build-only projects never need it.
-#
-# NOTE: this is phase-1 scaffolding. `ship` validates config and resolves paths;
-# the archive, export, manifest, and Vercel deploy steps land in a follow-up.
 
 # Detect the signing team (DEVELOPMENT_TEAM) from the project file. Echoes the
 # most common value, or nothing. Mirrors _detect_bundle_id's pbxproj grep.
@@ -1075,12 +1103,66 @@ ship_init() {
   printf "\n  Next steps:\n"
   printf "    1. Review:            cat .gleis.conf\n"
   printf "    2. Commit when ready: git add .gleis.conf && git commit -m \"Add gleis ship config\"\n"
-  printf "    3. (soon) ship it:    gleis ship\n\n"
+  printf "    3. Ship it:           gleis ship\n\n"
+}
+
+# Ensure the cache-backed Vercel deploy folder exists and is linked. gleis owns
+# generated deploy assets in this folder, but leaves any existing Vercel link in
+# place unless it points at the wrong project.
+ensure_ship_deploy_dir() {
+  local deploy_dir="$1" linked_project
+
+  mkdir -p "$deploy_dir"
+
+  if [[ ! -f "$deploy_dir/vercel.json" ]]; then
+    info "creating Vercel config → $deploy_dir/vercel.json"
+    cat > "$deploy_dir/vercel.json" <<'EOF'
+{
+  "headers": [
+    {
+      "source": "/manifest.plist",
+      "headers": [
+        { "key": "Content-Type", "value": "application/xml" }
+      ]
+    },
+    {
+      "source": "/(.*).ipa",
+      "headers": [
+        { "key": "Content-Type", "value": "application/octet-stream" }
+      ]
+    }
+  ]
+}
+EOF
+  fi
+
+  if [[ ! -f "$deploy_dir/.vercel/project.json" ]]; then
+    info "linking deploy dir to Vercel project '$VERCEL_PROJECT'…"
+    vercel link --yes --project "$VERCEL_PROJECT" --cwd "$deploy_dir" \
+      || die "vercel link failed for $deploy_dir
+  check that you're logged in with 'vercel login' and that project '$VERCEL_PROJECT' exists."
+  fi
+
+  [[ -f "$deploy_dir/.vercel/project.json" ]] \
+    || die "Vercel link did not create $deploy_dir/.vercel/project.json
+  run manually: vercel link --yes --project $VERCEL_PROJECT --cwd $deploy_dir"
+
+  linked_project=$(jq -r '.projectName // empty' "$deploy_dir/.vercel/project.json" 2>/dev/null || true)
+  [[ -z "$linked_project" || "$linked_project" == "$VERCEL_PROJECT" ]] \
+    || die "deploy dir is linked to Vercel project '$linked_project', not '$VERCEL_PROJECT'
+  fix the config or remove $deploy_dir/.vercel and re-run 'gleis ship'."
+}
+
+run_ship_xcode() {
+  if command -v xcbeautify >/dev/null 2>&1; then
+    "$@" 2>&1 | xcbeautify --quiet
+  else
+    "$@"
+  fi
 }
 
 # `gleis ship` — build the current worktree into a signed ad-hoc .ipa, generate
-# an OTA manifest, deploy to Vercel, print an install URL. This phase validates
-# config and resolves paths; archive/export/manifest/deploy land next.
+# an OTA manifest, deploy to Vercel, print an install URL.
 ship() {
   shift  # drop the leading "ship" subcommand
 
@@ -1098,9 +1180,9 @@ ship() {
 
   local repo worktree slug ship_dir
   repo=$(repo_root)
+  require_ship_tools
   load_config "$repo"
   require_ship_config
-  require vercel
 
   worktree="$repo"            # ship targets the worktree you're standing in
   slug=$(worktree_slug "$worktree")
@@ -1145,30 +1227,19 @@ ship() {
   fi
 
   echo
-  local buildnum lock_dir archive_path export_dir deploy_dir linked_project
+  local buildnum lock_dir archive_path export_dir deploy_dir
   local market_version ipa deploy_url install_url
   buildnum=$(date +%s)
   archive_path="$ship_dir/$PRODUCT_NAME.xcarchive"
   export_dir="$ship_dir/export"
-  deploy_dir="$CACHE_DIR/ship/deploy"
+  deploy_dir=$(ship_deploy_dir_for_repo "$repo")
   lock_dir="$ship_dir/.lock"
-
-  # The deploy dir is set up once (linked to Vercel, with its own vercel.json)
-  # and lives outside gleis's control — verify it before the slow archive rather
-  # than after. gleis never creates or edits vercel.json / .vercel/.
-  [[ -f "$deploy_dir/.vercel/project.json" && -f "$deploy_dir/vercel.json" ]] \
-    || die "deploy dir isn't set up: $deploy_dir
-  it must be a Vercel-linked folder (needs vercel.json and .vercel/project.json).
-  set it up once and link it to your '$VERCEL_PROJECT' project, then re-run."
-  linked_project=$(jq -r '.projectName // empty' "$deploy_dir/.vercel/project.json" 2>/dev/null || true)
-  [[ -z "$linked_project" || "$linked_project" == "$VERCEL_PROJECT" ]] \
-    || warn "deploy dir is linked to Vercel project '$linked_project', not '$VERCEL_PROJECT'"
 
   # Per-worktree ship lock, separate from the build lock (build_and_launch) so a
   # build and a ship on the same worktree don't share a lock — ship has its own
   # DerivedData and archives a release config, so they never touch the same
-  # files. Two concurrent ships *would* race on the archive/export/deploy paths,
-  # which this prevents.
+  # files. Two concurrent ships *would* race on setup/archive/export/deploy
+  # paths, which this prevents.
   mkdir -p "$ship_dir"
   if ! mkdir "$lock_dir" 2>/dev/null; then
     die "another gleis ship is already running for this worktree
@@ -1178,6 +1249,10 @@ ship() {
   # under `set -u` (same reasoning as build_and_launch).
   # shellcheck disable=SC2064  # early expansion is intentional
   trap "$(printf 'rmdir %q 2>/dev/null || true' "$lock_dir")" EXIT INT TERM
+
+  # Set up/link the deploy dir before the slow archive so Vercel/auth problems
+  # fail early and never waste a signed build.
+  ensure_ship_deploy_dir "$deploy_dir"
 
   cd "$worktree"
   ensure_local_files "$worktree"
@@ -1198,11 +1273,10 @@ ship() {
     archive
   )
   [[ "$SHIP_SIGNING" == "automatic" ]] && xc_archive+=(-allowProvisioningUpdates)
-  if command -v xcbeautify >/dev/null 2>&1; then
-    "${xc_archive[@]}" 2>&1 | xcbeautify --quiet
-  else
-    "${xc_archive[@]}"
-  fi
+  run_ship_xcode "${xc_archive[@]}" \
+    || die "archive failed — no .ipa was exported or deployed
+  fix the Xcode compile/signing errors above, then re-run: gleis ship
+  previous install remains unchanged: ${LAST_SHIP_URL:-https://$SHIP_DOMAIN/}"
   [[ -d "$archive_path" ]] || die "archive failed — no .xcarchive at $archive_path"
   ok "archived"
 
@@ -1240,13 +1314,13 @@ EOF
     -exportPath "$export_dir"
   )
   [[ "$SHIP_SIGNING" == "automatic" ]] && xc_export+=(-allowProvisioningUpdates)
-  if command -v xcbeautify >/dev/null 2>&1; then
-    "${xc_export[@]}" 2>&1 | xcbeautify --quiet
-  else
-    "${xc_export[@]}"
-  fi
+  run_ship_xcode "${xc_export[@]}" \
+    || die "export failed — no .ipa was staged or deployed
+  check signing/export settings (TEAM_ID=$TEAM_ID, SHIP_METHOD=$SHIP_METHOD, SHIP_SIGNING=$SHIP_SIGNING, export options: $export_opts)
+  previous install remains unchanged: ${LAST_SHIP_URL:-https://$SHIP_DOMAIN/}"
   ipa=$(find "$export_dir" -maxdepth 1 -name '*.ipa' 2>/dev/null || true)
   [[ -n "$ipa" && -f "$ipa" ]] || die "export produced no .ipa in $export_dir
+  no .ipa was staged or deployed.
   check signing (TEAM_ID=$TEAM_ID, SHIP_SIGNING=$SHIP_SIGNING) and your export options."
   ok "exported $(basename "$ipa")"
 
@@ -1516,7 +1590,7 @@ doctor() {
   fi
 
   _section "current project"
-  local repo=""
+  local repo="" cfg=""
   repo=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || true)
   if [[ -z "$repo" && -n "${GLEIS_REPO:-}" ]]; then
     repo="$GLEIS_REPO"
@@ -1529,7 +1603,7 @@ doctor() {
   else
     _row_ok "repo: $repo"
     # Look for the config files in priority order
-    local cfg="" cand
+    local cand
     for cand in \
         "${GLEIS_CONFIG:-}" \
         "$repo/.gleis.conf" \
@@ -1545,6 +1619,8 @@ doctor() {
       _row_ok "config: $cfg"
       # Try to load it without dying — re-do load_config inline with no exits
       local SCHEME="" PROJECT="" BUNDLE_ID="" PRODUCT_NAME="" CONFIG="Debug"
+      local TEAM_ID="" SHIP_DOMAIN="" VERCEL_PROJECT=""
+      local SHIP_CONFIG="Release" SHIP_METHOD="release-testing" SHIP_SIGNING="automatic" SHIP_TITLE="" EXPORT_OPTIONS=""
       local LOCAL_FILES=()
       # shellcheck disable=SC1090
       if ( source "$cfg" 2>/dev/null && \
@@ -1562,6 +1638,54 @@ doctor() {
         _row_err "PROJECT not found at $repo/$PROJECT"
         _row_hint "fix the PROJECT value in $cfg"
         fail=1
+      fi
+    fi
+  fi
+
+  _section "ship"
+  if [[ -z "$repo" ]]; then
+    _row_warn "not in a repo — skipping"
+  elif [[ -z "$cfg" ]]; then
+    _row_warn "no usable config — skipping"
+    _row_hint "run 'gleis init' first, then 'gleis ship init'"
+  else
+    local ship_missing=()
+    [[ -n "${TEAM_ID:-}" ]]        || ship_missing+=("TEAM_ID")
+    [[ -n "${SHIP_DOMAIN:-}" ]]    || ship_missing+=("SHIP_DOMAIN")
+    [[ -n "${VERCEL_PROJECT:-}" ]] || ship_missing+=("VERCEL_PROJECT")
+    if (( ${#ship_missing[@]} )); then
+      _row_warn "ship config incomplete: ${ship_missing[*]}"
+      _row_hint "fill it interactively with: gleis ship init"
+    else
+      _row_ok "ship config present for https://$SHIP_DOMAIN"
+      if command -v vercel >/dev/null 2>&1; then
+        _row_ok "vercel"
+      else
+        _row_err "vercel  (missing; required by 'gleis ship')"
+        _row_hint "install with: npm install -g vercel"
+        fail=1
+      fi
+
+      local deploy_dir linked_project
+      deploy_dir=$(ship_deploy_dir_for_repo "$repo")
+      if [[ -f "$deploy_dir/vercel.json" ]]; then
+        _row_ok "deploy config: $deploy_dir/vercel.json"
+      else
+        _row_warn "deploy config not bootstrapped yet"
+        _row_hint "'gleis ship' will create $deploy_dir/vercel.json"
+      fi
+      if [[ -f "$deploy_dir/.vercel/project.json" ]]; then
+        linked_project=$(jq -r '.projectName // empty' "$deploy_dir/.vercel/project.json" 2>/dev/null || true)
+        if [[ -z "$linked_project" || "$linked_project" == "$VERCEL_PROJECT" ]]; then
+          _row_ok "Vercel link: ${linked_project:-unknown project}"
+        else
+          _row_err "Vercel link points at '$linked_project', expected '$VERCEL_PROJECT'"
+          _row_hint "remove $deploy_dir/.vercel and re-run 'gleis ship'"
+          fail=1
+        fi
+      else
+        _row_warn "Vercel link not created yet"
+        _row_hint "'gleis ship' will run: vercel link --yes --project $VERCEL_PROJECT --cwd $deploy_dir"
       fi
     fi
   fi

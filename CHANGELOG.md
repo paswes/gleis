@@ -2,6 +2,22 @@
 
 All notable changes to gleis.
 
+## [1.2.0] — 2026-05-28
+
+### Added
+
+- `gleis ship` is now documented in help, README, and example config.
+- `gleis doctor` now reports ship config, Vercel CLI availability, deploy cache
+  bootstrap status, and linked Vercel project mismatches.
+
+### Changed
+
+- Ship deploy staging is now per repo under `~/Library/Caches/gleis/ship/`,
+  preventing different apps from sharing one deploy folder.
+- `gleis ship` now bootstraps its Vercel deploy folder automatically by writing
+  `vercel.json` and running `vercel link --yes --project ...` when needed.
+- `gleis ship init` no longer describes shipping as a future step.
+
 ## [1.1.6] — 2026-05-27
 
 ### Changed

@@ -50,6 +50,7 @@ if (( ${#missing[@]} )); then
 fi
 command -v xcbeautify     >/dev/null 2>&1 || warn "optional: brew install xcbeautify (prettier build output)"
 command -v idevicesyslog  >/dev/null 2>&1 || warn "recommended: brew install libimobiledevice (Xcode-style device logs)"
+command -v vercel         >/dev/null 2>&1 || warn "ship only: npm install -g vercel (deploy OTA install page)"
 
 echo
 ok "gleis $($SCRIPT --version | awk '{print $2}') installed."
@@ -59,4 +60,5 @@ echo "  cd ~/Code/YourApp     # the main worktree of your iOS project"
 echo "  gleis init            # interactive setup; auto-detects most values"
 echo
 echo "Then 'gleis doctor' to verify, and 'gleis' to build + launch."
+echo "For OTA installs, run 'gleis ship init' in the project, then 'gleis ship'."
 echo "Detailed setup notes: $REPO_DIR/README.md"
