@@ -19,7 +19,7 @@ git add .gleis.conf && git commit -m "Add gleis config"
 # 3. Build & launch
 gleis           # interactive picker
 gleis --last    # repeat last worktree + destination
-gleis doctor    # check setup if something looks off
+gleis wartung    # check setup if something looks off
 ```
 
 That's the whole flow. Read on for the details.
@@ -39,7 +39,7 @@ Dependencies (installer will warn you if they're missing):
 ```sh
 brew install fzf jq xcbeautify        # required + recommended
 brew install libimobiledevice         # recommended: Xcode-style device logs
-npm install -g vercel                 # only needed for gleis ship
+npm install -g vercel                 # only needed for gleis abfahrt
 ```
 
 ## Configure for your project
@@ -89,9 +89,9 @@ Both are optional and meant for your shell config:
 - **`GLEIS_CONFIG`** — absolute path to a config file that wins over all of the above. Handy for pointing gleis at a config outside the repo.
 - **`GLEIS_REPO`** — a repo root to fall back to *only when you're not inside a git repo*. Lets `gleis` run from anywhere without hijacking runs in other projects (an enclosing repo always takes precedence).
 
-## Ship OTA builds
+## Abfahrt OTA builds
 
-`gleis ship` builds the current worktree for a generic iOS device, exports a
+`gleis abfahrt` builds the current worktree for a generic iOS device, exports a
 signed `.ipa`, generates an OTA manifest and install page, then deploys them to
 Vercel. Open `https://$SHIP_DOMAIN/` on your iPhone in Safari and tap Install.
 That URL always points at the latest shipped build.
@@ -100,11 +100,11 @@ Set it up once per app:
 
 ```sh
 cd ~/Code/YourApp
-gleis ship init          # adds ship settings to .gleis.conf
-gleis ship               # archive, export, deploy, print install URL
+gleis abfahrt init          # adds abfahrt settings to .gleis.conf
+gleis abfahrt               # archive, export, deploy, print install URL
 ```
 
-Required ship config:
+Required abfahrt config:
 
 ```sh
 TEAM_ID="ABCDE12345"
@@ -112,7 +112,7 @@ SHIP_DOMAIN="install.example.app"
 VERCEL_PROJECT="your-vercel-project"
 ```
 
-Optional ship config:
+Optional abfahrt config:
 
 ```sh
 SHIP_CONFIG="Release"
@@ -122,7 +122,7 @@ SHIP_TITLE="MyApp"
 EXPORT_OPTIONS="ExportOptions.plist"
 ```
 
-On the first run, `gleis ship` creates a per-project deploy folder under
+On the first run, `gleis abfahrt` creates a per-project deploy folder under
 `~/Library/Caches/gleis/ship/`, writes a static `vercel.json` if needed, and
 links that folder to `VERCEL_PROJECT` with `vercel link --yes --project ...`.
 You need to be logged in with `vercel login`, and the Vercel project should
@@ -143,9 +143,9 @@ gleis --verbose-logs        with --logs, show raw unfiltered device logs
 gleis --no-launch           build + install only, don't launch
 gleis --clean               clean rebuild: wipe selected worktree's DerivedData
 gleis init                  create .gleis.conf for the current project
-gleis ship init             add OTA shipping settings to .gleis.conf
-gleis ship                  archive, export, deploy, print install URL
-gleis doctor                diagnose your gleis setup
+gleis abfahrt init          add OTA shipping settings to .gleis.conf
+gleis abfahrt               archive, export, deploy, print install URL
+gleis wartung               diagnose your gleis setup
 gleis prune                 remove build caches for deleted worktrees
 gleis prune --all           clear all gleis build caches
 gleis --version             print version
@@ -186,7 +186,7 @@ Cleanup commands have different scopes:
 5. Install + launch via `simctl` (sim) or `devicectl` (device).
 6. With `--logs`: launch with the app console attached on simulators, and on physical devices start `idevicesyslog` before launch so Xcode-style device logs are captured from process start. Physical-device logs are focused by default: gleis keeps app/app-debug-dylib messages, strips the syslog prefix, and hides framework startup chatter. Add `--verbose-logs` to show the raw stream. If `libimobiledevice` is not installed, device logging falls back to `devicectl ... launch --console`.
 
-`gleis ship` uses the same project config but does not pick a destination. It
+`gleis abfahrt` uses the same project config but does not pick a destination. It
 archives with `xcodebuild archive`, exports with `xcodebuild -exportArchive`,
 stages `PRODUCT_NAME.ipa`, `manifest.plist`, and `index.html` into a
 per-project deploy cache, then runs `vercel deploy --prod --yes`.
@@ -196,14 +196,14 @@ per-project deploy cache, then runs `vercel deploy --prod --yes`.
 | What                | Where                                                          |
 | ------------------- | -------------------------------------------------------------- |
 | Last selection      | `~/Library/Caches/gleis/state/<repo-name>-<hash>` (per repo)       |
-| Last ship           | `~/Library/Caches/gleis/state/<repo-name>-<hash>.ship`             |
+| Last abfahrt        | `~/Library/Caches/gleis/state/<repo-name>-<hash>.ship`             |
 | Per-worktree builds | `~/Library/Caches/gleis/build/<sha1-prefix>/DerivedData/`         |
-| Ship artifacts      | `~/Library/Caches/gleis/ship/<sha1-prefix>/`                       |
+| Abfahrt artifacts   | `~/Library/Caches/gleis/ship/<sha1-prefix>/`                       |
 | Configs             | `<repo>/.gleis.conf` or `~/.config/gleis/`                           |
 
 State is per-repo, so `gleis --last` in one project doesn't get confused by another. The `<hash>` keys the path, so two repos that happen to share a name don't collide.
 
-Per-worktree build caches accumulate as you create and delete worktrees. Run `gleis prune` to drop caches whose worktree no longer exists, or `gleis prune --all` to clear every gleis build cache. `gleis doctor` reports the current cache size.
+Per-worktree build caches accumulate as you create and delete worktrees. Run `gleis prune` to drop caches whose worktree no longer exists, or `gleis prune --all` to clear every gleis build cache. `gleis wartung` reports the current cache size.
 
 ## Updating
 
@@ -241,11 +241,11 @@ everything without a prompt:
 
 **Build succeeds but app behaves wrong** — try `gleis --clean --last` to wipe DerivedData. Mostly needed after build-setting or signing changes.
 
-**`gleis ship` says ship config is missing** — run `gleis ship init` from inside the iOS repo, or add `TEAM_ID`, `SHIP_DOMAIN`, and `VERCEL_PROJECT` to your config.
+**`gleis abfahrt` says abfahrt config is missing** — run `gleis abfahrt init` from inside the iOS repo, or add `TEAM_ID`, `SHIP_DOMAIN`, and `VERCEL_PROJECT` to your config.
 
-**`gleis ship` cannot link or deploy to Vercel** — run `vercel login`, confirm `VERCEL_PROJECT` exists, and confirm `SHIP_DOMAIN` is configured on that Vercel project. `gleis doctor` shows the per-project deploy cache path and linked project.
+**`gleis abfahrt` cannot link or deploy to Vercel** — run `vercel login`, confirm `VERCEL_PROJECT` exists, and confirm `SHIP_DOMAIN` is configured on that Vercel project. `gleis wartung` shows the per-project deploy cache path and linked project.
 
-**`gleis ship` exports no `.ipa`** — check your Apple team/signing settings, especially `TEAM_ID`, `SHIP_METHOD`, `SHIP_SIGNING`, or a custom `EXPORT_OPTIONS` file.
+**`gleis abfahrt` exports no `.ipa`** — check your Apple team/signing settings, especially `TEAM_ID`, `SHIP_METHOD`, `SHIP_SIGNING`, or a custom `EXPORT_OPTIONS` file.
 
 **`--logs` on device shows only "Waiting for the application to terminate…"** — install `libimobiledevice` with `brew install libimobiledevice`. Without `idevicesyslog`, Apple's `devicectl --console` only attaches app stdout/stderr and may not show the same unified/debug console entries Xcode displays.
 

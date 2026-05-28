@@ -13,9 +13,9 @@
 #   gleis --no-launch             build + install only, don't launch
 #   gleis --clean                 clean rebuild: wipe selected worktree's DerivedData
 #   gleis init                    create .gleis.conf for the current project
-#   gleis ship init               add OTA shipping settings to .gleis.conf
-#   gleis ship                    archive, export, deploy, and print install URL
-#   gleis doctor                  diagnose your gleis setup
+#   gleis abfahrt init            add OTA shipping settings to .gleis.conf
+#   gleis abfahrt                 archive, export, deploy, and print install URL
+#   gleis wartung                 diagnose your gleis setup
 #   gleis prune                   remove build caches for deleted worktrees
 #   gleis prune --all             clear all gleis build caches
 #   gleis --version               print version
@@ -46,7 +46,7 @@
 #     PRODUCT_NAME — the .app filename if it differs from SCHEME
 #                    (default: same as SCHEME)
 #     LOCAL_FILES  — array of gitignored files to auto-copy across worktrees
-#     TEAM_ID / SHIP_DOMAIN / VERCEL_PROJECT — required only for `gleis ship`
+#     TEAM_ID / SHIP_DOMAIN / VERCEL_PROJECT — required only for `gleis abfahrt`
 
 readonly GLEIS_VERSION="1.2.0"
 
@@ -91,7 +91,7 @@ require_ship_tools() {
       vercel)     hints+=("npm install -g vercel  # then: vercel login") ;;
     esac
   done
-  die "missing ship tool(s): ${missing[*]}
+  die "missing abfahrt tool(s): ${missing[*]}
   $(printf '%s\n  ' "${hints[@]}")"
 }
 
@@ -106,15 +106,21 @@ for arg in "$@"; do
       echo "gleis $GLEIS_VERSION"
       exit 0
       ;;
+    ship)
+      die "'gleis ship' was renamed to 'gleis abfahrt'"
+      ;;
     doctor)
-      # `doctor` runs without requiring deps — it diagnoses what's missing.
+      die "'gleis doctor' was renamed to 'gleis wartung'"
+      ;;
+    wartung)
+      # `wartung` runs without requiring deps — it diagnoses what's missing.
       # Implementation is deferred until after helper functions are defined,
       # so we just record intent here and dispatch at the end.
-      GLEIS_DOCTOR_MODE=1
+      GLEIS_WARTUNG_MODE=1
       ;;
     init)
       # `init` walks the user through creating a .gleis.conf for the current
-      # project. Like doctor, it bypasses the dep-check so it can guide users
+      # project. Like wartung, it bypasses the dep-check so it can guide users
       # who haven't installed everything yet.
       GLEIS_INIT_MODE=1
       ;;
@@ -126,19 +132,19 @@ for arg in "$@"; do
   esac
 done
 
-# `ship` is a leading subcommand with its own `init` sub-subcommand, so it's
+# `abfahrt` is a leading subcommand with its own `init` sub-subcommand, so it's
 # detected on $1 here rather than via the keyword scan above — otherwise
-# `gleis ship init` would trip the `init)` arm and run the project init. Like
+# `gleis abfahrt init` would trip the `init)` arm and run the project init. Like
 # the others, its implementation is deferred to the dispatch tail. Plain
-# `gleis ship` has its own dep-check so it can require Vercel without making
+# `gleis abfahrt` has its own dep-check so it can require Vercel without making
 # the normal build/launch path depend on it.
-if [[ "${1:-}" == "ship" ]]; then
-  GLEIS_SHIP_MODE=1
+if [[ "${1:-}" == "abfahrt" ]]; then
+  GLEIS_ABFAHRT_MODE=1
 fi
 
-# Required runtime tools — checked here for normal commands. doctor, init, and
+# Required runtime tools — checked here for normal commands. wartung, init, and
 # prune bypass this (they work without a full build toolchain).
-if [[ -z "${GLEIS_DOCTOR_MODE:-}" && -z "${GLEIS_INIT_MODE:-}" && -z "${GLEIS_PRUNE_MODE:-}" && -z "${GLEIS_SHIP_MODE:-}" ]]; then
+if [[ -z "${GLEIS_WARTUNG_MODE:-}" && -z "${GLEIS_INIT_MODE:-}" && -z "${GLEIS_PRUNE_MODE:-}" && -z "${GLEIS_ABFAHRT_MODE:-}" ]]; then
   require fzf jq xcodebuild xcrun
 fi
 
@@ -203,7 +209,7 @@ load_config() {
   CONFIG="Debug"
   PRODUCT_NAME=""
   LOCAL_FILES=()
-  # Ship (gleis ship) settings — optional here, validated only when `ship` runs
+  # Ship (gleis abfahrt) settings — optional here, validated only when `abfahrt` runs
   # (require_ship_config), so build-only projects never need them. Defined up
   # front so reads stay safe under `set -u`.
   TEAM_ID=""
@@ -275,7 +281,7 @@ $(echo "$schemes" | sed 's/^/    /')"
 
 # Output: <path>\t<branch-or-HEAD>  for each worktree of repo $1 that contains
 # project $2. Takes both explicitly (rather than reading globals) so callers
-# that must not die — e.g. doctor — can use it without going through repo_root.
+# that must not die — e.g. wartung — can use it without going through repo_root.
 _worktrees_with_project() {
   local repo="$1" project="$2" path branch
   git -C "$repo" worktree list --porcelain | awk '
@@ -385,7 +391,7 @@ select_destination() {
   [[ -n "$rows" ]] || die "no destinations found
   - boot a simulator: open -a Simulator  (or 'xcrun simctl boot <name>')
   - or connect an iPhone, unlock it, and trust this Mac
-  - run 'gleis doctor' to see what gleis can find"
+  - run 'gleis wartung' to see what gleis can find"
 
   choice=$(echo "$rows" | fzf \
     --prompt="destination ❯ " \
@@ -743,7 +749,7 @@ ship_deploy_dir_for_repo() {
   printf '%s/ship/%s/deploy' "$CACHE_DIR" "$slug"
 }
 
-# Written after deploy; read before the next run so `gleis ship` can show the
+# Written after deploy; read before the next run so `gleis abfahrt` can show the
 # previous install URL. Mirrors save_state/load_state's quoted, source-able form.
 save_ship_state() {
   local state_file="$1" version="$2" build="$3" url="$4"
@@ -895,7 +901,7 @@ init() {
     if ! _confirm "Reconfigure (will overwrite)?" "n"; then
       info "leaving existing config in place"
       printf "\n  To verify your setup:\n"
-      printf "    gleis doctor\n\n"
+      printf "    gleis wartung\n\n"
       return 0
     fi
     cp "$conf" "$conf.bak.$(date +%s)"
@@ -978,14 +984,14 @@ init() {
   ok "wrote $conf"
   printf "\n  Next steps:\n"
   printf "    1. Review the file:        cat .gleis.conf\n"
-  printf "    2. Verify setup:           gleis doctor\n"
+  printf "    2. Verify setup:           gleis wartung\n"
   printf "    3. Commit when ready:      git add .gleis.conf && git commit -m \"Add gleis config\"\n"
   printf "    4. Build & launch:         gleis\n\n"
 }
 
-# ─── ship ────────────────────────────────────────────────────────────────────
+# ─── abfahrt ─────────────────────────────────────────────────────────────────
 
-# Ship layers on top of the build config (SCHEME/PROJECT/BUNDLE_ID): it archives
+# Abfahrt layers on top of the build config (SCHEME/PROJECT/BUNDLE_ID): it archives
 # a signed ad-hoc .ipa, writes an OTA install manifest, deploys both to Vercel,
 # and prints an install URL. Its extra config lives in the same .gleis.conf but
 # is validated only here, so build-only projects never need it.
@@ -1006,40 +1012,40 @@ _detect_team_id() {
     | grep -v '^$' | sort | uniq -c | sort -rn | head -1 | awk '{print $2}'
 }
 
-# Validate the ship-only config fields. Collects everything missing so the user
-# fixes it in one pass; each line carries its fix (config var or `ship init`).
+# Validate the abfahrt-only config fields. Collects everything missing so the user
+# fixes it in one pass; each line carries its fix (config var or `abfahrt init`).
 require_ship_config() {
   local missing=()
   [[ -n "${TEAM_ID:-}" ]]        || missing+=("TEAM_ID")
   [[ -n "${SHIP_DOMAIN:-}" ]]    || missing+=("SHIP_DOMAIN")
   [[ -n "${VERCEL_PROJECT:-}" ]] || missing+=("VERCEL_PROJECT")
   (( ${#missing[@]} == 0 )) && return 0
-  die "ship config in $CONFIG_FILE is missing: ${missing[*]}
-  add the ship settings, e.g.:
+  die "abfahrt config in $CONFIG_FILE is missing: ${missing[*]}
+  add the abfahrt settings, e.g.:
     TEAM_ID=\"ABCDE12345\"
     SHIP_DOMAIN=\"install.example.app\"
     VERCEL_PROJECT=\"your-vercel-project\"
-  or fill them in interactively: gleis ship init"
+  or fill them in interactively: gleis abfahrt init"
 }
 
-# `gleis ship init` — add/update the ship settings block in .gleis.conf.
-# Requires an existing build config (ship extends it). Auto-detects TEAM_ID.
-ship_init() {
-  printf "\n%s── gleis ship init ──%s\n\n" "$c_bold" "$c_reset"
+# `gleis abfahrt init` — add/update the ship settings block in .gleis.conf.
+# Requires an existing build config (abfahrt extends it). Auto-detects TEAM_ID.
+abfahrt_init() {
+  printf "\n%s── gleis abfahrt init ──%s\n\n" "$c_bold" "$c_reset"
 
   local repo
   repo=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || {
-    die "not in a git repo — cd into your iOS project, then run 'gleis ship init' again"
+    die "not in a git repo — cd into your iOS project, then run 'gleis abfahrt init' again"
   }
   info "repo: $repo"
 
   local conf="$repo/.gleis.conf"
   [[ -f "$conf" ]] || die "no .gleis.conf in this repo yet
-  ship settings extend your build config (SCHEME/PROJECT/BUNDLE_ID).
+  abfahrt settings extend your build config (SCHEME/PROJECT/BUNDLE_ID).
   create it first with: gleis init"
 
   # Seed defaults from the existing config so re-running shows current values.
-  # Only the fields ship_init reads are declared local; any others the config
+  # Only the fields abfahrt_init reads are declared local; any others the config
   # sets are harmless to leave to the source.
   local SCHEME="" PROJECT="" BUNDLE_ID=""
   local TEAM_ID="" SHIP_DOMAIN="" VERCEL_PROJECT=""
@@ -1062,7 +1068,7 @@ ship_init() {
   vercel=$(_prompt "VERCEL_PROJECT (Vercel deploy target)"        "$VERCEL_PROJECT")
 
   [[ -n "$team" && -n "$domain" && -n "$vercel" ]] \
-    || die "TEAM_ID, SHIP_DOMAIN, and VERCEL_PROJECT are all required for ship"
+    || die "TEAM_ID, SHIP_DOMAIN, and VERCEL_PROJECT are all required for abfahrt"
 
   printf "\n  ──\n"
   printf "  Optional — press Enter to accept each default.\n"
@@ -1089,7 +1095,7 @@ ship_init() {
   {
     cat "$tmp"
     # shellcheck disable=SC2016
-    printf '\n# ── Ship ── (gleis ship) — added by `gleis ship init` on %s\n' "$(date '+%Y-%m-%d')"
+    printf '\n# ── Ship ── (gleis abfahrt) — added by `gleis abfahrt init` on %s\n' "$(date '+%Y-%m-%d')"
     printf 'TEAM_ID=%q\n'        "$team"
     printf 'SHIP_DOMAIN=%q\n'    "$domain"
     printf 'VERCEL_PROJECT=%q\n' "$vercel"
@@ -1102,8 +1108,8 @@ ship_init() {
   ok "updated $conf"
   printf "\n  Next steps:\n"
   printf "    1. Review:            cat .gleis.conf\n"
-  printf "    2. Commit when ready: git add .gleis.conf && git commit -m \"Add gleis ship config\"\n"
-  printf "    3. Ship it:           gleis ship\n\n"
+  printf "    2. Commit when ready: git add .gleis.conf && git commit -m \"Add gleis abfahrt config\"\n"
+  printf "    3. Ship it:           gleis abfahrt\n\n"
 }
 
 # Ensure the cache-backed Vercel deploy folder exists and is linked. gleis owns
@@ -1150,7 +1156,7 @@ EOF
   linked_project=$(jq -r '.projectName // empty' "$deploy_dir/.vercel/project.json" 2>/dev/null || true)
   [[ -z "$linked_project" || "$linked_project" == "$VERCEL_PROJECT" ]] \
     || die "deploy dir is linked to Vercel project '$linked_project', not '$VERCEL_PROJECT'
-  fix the config or remove $deploy_dir/.vercel and re-run 'gleis ship'."
+  fix the config or remove $deploy_dir/.vercel and re-run 'gleis abfahrt'."
 }
 
 run_ship_xcode() {
@@ -1161,21 +1167,21 @@ run_ship_xcode() {
   fi
 }
 
-# `gleis ship` — build the current worktree into a signed ad-hoc .ipa, generate
+# `gleis abfahrt` — build the current worktree into a signed ad-hoc .ipa, generate
 # an OTA manifest, deploy to Vercel, print an install URL.
-ship() {
-  shift  # drop the leading "ship" subcommand
+abfahrt() {
+  shift  # drop the leading "abfahrt" subcommand
 
   if [[ "${1:-}" == "init" ]]; then
     shift
-    ship_init "$@"
+    abfahrt_init "$@"
     return $?
   fi
 
   case "${1:-}" in
     "")  ;;
-    -*)  die "unknown flag for ship: $1" ;;
-    *)   die "unknown argument for ship: $1 (did you mean 'gleis ship init'?)" ;;
+    -*)  die "unknown flag for abfahrt: $1" ;;
+    *)   die "unknown argument for abfahrt: $1 (did you mean 'gleis abfahrt init'?)" ;;
   esac
 
   local repo worktree slug ship_dir
@@ -1204,7 +1210,7 @@ ship() {
     export_opts="$ship_dir/ExportOptions.plist"
   fi
 
-  printf "\n%s── gleis ship ──%s\n" "$c_bold" "$c_reset"
+  printf "\n%s── gleis abfahrt ──%s\n" "$c_bold" "$c_reset"
   info "worktree:    $worktree"
   info "scheme:      $SCHEME ($SHIP_CONFIG)"
   info "bundle id:   $BUNDLE_ID"
@@ -1223,7 +1229,7 @@ ship() {
   local ship_state
   ship_state=$(ship_state_file_for_repo "$repo")
   if load_ship_state "$ship_state"; then
-    info "last ship:   ${LAST_SHIP_VERSION:-?} (${LAST_SHIP_BUILD:-?}) → ${LAST_SHIP_URL:-?}"
+    info "last abfahrt: ${LAST_SHIP_VERSION:-?} (${LAST_SHIP_BUILD:-?}) → ${LAST_SHIP_URL:-?}"
   fi
 
   echo
@@ -1242,7 +1248,7 @@ ship() {
   # paths, which this prevents.
   mkdir -p "$ship_dir"
   if ! mkdir "$lock_dir" 2>/dev/null; then
-    die "another gleis ship is already running for this worktree
+    die "another gleis abfahrt is already running for this worktree
   if you're sure nothing else is running, remove: $lock_dir"
   fi
   # Bake lock_dir's value into the trap now so it survives the function returning
@@ -1275,7 +1281,7 @@ ship() {
   [[ "$SHIP_SIGNING" == "automatic" ]] && xc_archive+=(-allowProvisioningUpdates)
   run_ship_xcode "${xc_archive[@]}" \
     || die "archive failed — no .ipa was exported or deployed
-  fix the Xcode compile/signing errors above, then re-run: gleis ship
+  fix the Xcode compile/signing errors above, then re-run: gleis abfahrt
   previous install remains unchanged: ${LAST_SHIP_URL:-https://$SHIP_DOMAIN/}"
   [[ -d "$archive_path" ]] || die "archive failed — no .xcarchive at $archive_path"
   ok "archived"
@@ -1484,7 +1490,7 @@ prune() {
   ok "reclaimed ~${freed} MB"
 }
 
-# ─── doctor ──────────────────────────────────────────────────────────────────
+# ─── wartung ─────────────────────────────────────────────────────────────────
 
 # Status row helpers. Each prints one diagnostic line plus, on failure, a "→"
 # suggestion line. Output is intentionally plain so it copy-pastes well.
@@ -1497,7 +1503,7 @@ _section() { printf "\n%s%s%s\n" "$c_bold" "$*" "$c_reset"; }
 
 # Returns nonzero if any required check failed. Optional issues report as
 # warnings but don't affect exit code.
-doctor() {
+wartung() {
   local fail=0
 
   _section "gleis"
@@ -1599,7 +1605,7 @@ doctor() {
   if [[ -z "$repo" ]]; then
     _row_warn "not inside a git repo"
     _row_hint "cd into an iOS project repo, or set GLEIS_REPO=/path/to/project"
-    _row_hint "(this is informational; doctor itself works anywhere)"
+    _row_hint "(this is informational; wartung itself works anywhere)"
   else
     _row_ok "repo: $repo"
     # Look for the config files in priority order
@@ -1642,26 +1648,26 @@ doctor() {
     fi
   fi
 
-  _section "ship"
+  _section "abfahrt"
   if [[ -z "$repo" ]]; then
     _row_warn "not in a repo — skipping"
   elif [[ -z "$cfg" ]]; then
     _row_warn "no usable config — skipping"
-    _row_hint "run 'gleis init' first, then 'gleis ship init'"
+    _row_hint "run 'gleis init' first, then 'gleis abfahrt init'"
   else
     local ship_missing=()
     [[ -n "${TEAM_ID:-}" ]]        || ship_missing+=("TEAM_ID")
     [[ -n "${SHIP_DOMAIN:-}" ]]    || ship_missing+=("SHIP_DOMAIN")
     [[ -n "${VERCEL_PROJECT:-}" ]] || ship_missing+=("VERCEL_PROJECT")
     if (( ${#ship_missing[@]} )); then
-      _row_warn "ship config incomplete: ${ship_missing[*]}"
-      _row_hint "fill it interactively with: gleis ship init"
+      _row_warn "abfahrt config incomplete: ${ship_missing[*]}"
+      _row_hint "fill it interactively with: gleis abfahrt init"
     else
-      _row_ok "ship config present for https://$SHIP_DOMAIN"
+      _row_ok "abfahrt config present for https://$SHIP_DOMAIN"
       if command -v vercel >/dev/null 2>&1; then
         _row_ok "vercel"
       else
-        _row_err "vercel  (missing; required by 'gleis ship')"
+        _row_err "vercel  (missing; required by 'gleis abfahrt')"
         _row_hint "install with: npm install -g vercel"
         fail=1
       fi
@@ -1672,7 +1678,7 @@ doctor() {
         _row_ok "deploy config: $deploy_dir/vercel.json"
       else
         _row_warn "deploy config not bootstrapped yet"
-        _row_hint "'gleis ship' will create $deploy_dir/vercel.json"
+        _row_hint "'gleis abfahrt' will create $deploy_dir/vercel.json"
       fi
       if [[ -f "$deploy_dir/.vercel/project.json" ]]; then
         linked_project=$(jq -r '.projectName // empty' "$deploy_dir/.vercel/project.json" 2>/dev/null || true)
@@ -1680,12 +1686,12 @@ doctor() {
           _row_ok "Vercel link: ${linked_project:-unknown project}"
         else
           _row_err "Vercel link points at '$linked_project', expected '$VERCEL_PROJECT'"
-          _row_hint "remove $deploy_dir/.vercel and re-run 'gleis ship'"
+          _row_hint "remove $deploy_dir/.vercel and re-run 'gleis abfahrt'"
           fail=1
         fi
       else
         _row_warn "Vercel link not created yet"
-        _row_hint "'gleis ship' will run: vercel link --yes --project $VERCEL_PROJECT --cwd $deploy_dir"
+        _row_hint "'gleis abfahrt' will run: vercel link --yes --project $VERCEL_PROJECT --cwd $deploy_dir"
       fi
     fi
   fi
@@ -1716,7 +1722,7 @@ doctor() {
     local sf last_line last_wt last_disp
     sf=$(state_file_for_repo "$repo")
     if [[ -f "$sf" ]]; then
-      # Read in a subshell so LAST_* don't leak into doctor's scope.
+      # Read in a subshell so LAST_* don't leak into wartung's scope.
       last_line=$( # shellcheck disable=SC1090
         source "$sf" 2>/dev/null; printf '%s\t%s' "${LAST_WORKTREE:-}" "${LAST_DISPLAY:-}")
       IFS=$'\t' read -r last_wt last_disp <<<"$last_line"
@@ -1831,8 +1837,8 @@ main() {
   build_and_launch "$worktree" "$kind" "$udid" "$display" "$clean" "$launch" "$logs" "$verbose_logs"
 }
 
-if [[ -n "${GLEIS_SHIP_MODE:-}" ]]; then
-  ship "$@"
+if [[ -n "${GLEIS_ABFAHRT_MODE:-}" ]]; then
+  abfahrt "$@"
   exit $?
 fi
 
@@ -1841,8 +1847,8 @@ if [[ -n "${GLEIS_INIT_MODE:-}" ]]; then
   exit $?
 fi
 
-if [[ -n "${GLEIS_DOCTOR_MODE:-}" ]]; then
-  doctor
+if [[ -n "${GLEIS_WARTUNG_MODE:-}" ]]; then
+  wartung
   exit $?
 fi
 

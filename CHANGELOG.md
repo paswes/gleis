@@ -6,17 +6,19 @@ All notable changes to gleis.
 
 ### Added
 
-- `gleis ship` is now documented in help, README, and example config.
-- `gleis doctor` now reports ship config, Vercel CLI availability, deploy cache
+- `gleis abfahrt` is now documented in help, README, and example config.
+- `gleis wartung` now reports abfahrt config, Vercel CLI availability, deploy cache
   bootstrap status, and linked Vercel project mismatches.
 
 ### Changed
 
+- CLI commands were renamed: `gleis ship` is now `gleis abfahrt`, and
+  `gleis doctor` is now `gleis wartung`.
 - Ship deploy staging is now per repo under `~/Library/Caches/gleis/ship/`,
   preventing different apps from sharing one deploy folder.
-- `gleis ship` now bootstraps its Vercel deploy folder automatically by writing
+- `gleis abfahrt` now bootstraps its Vercel deploy folder automatically by writing
   `vercel.json` and running `vercel link --yes --project ...` when needed.
-- `gleis ship init` no longer describes shipping as a future step.
+- `gleis abfahrt init` no longer describes shipping as a future step.
 
 ## [1.1.6] — 2026-05-27
 
@@ -80,7 +82,7 @@ All notable changes to gleis.
   DerivedData of worktrees that no longer exist. `gleis prune --all` clears
   the whole build cache. Previews what it will delete and confirms first, and
   never touches a build that's in progress.
-- `gleis doctor` is now a status dashboard: alongside the existing checks it
+- `gleis wartung` is now a status dashboard: alongside the existing checks it
   lists the worktrees that contain your project, shows the last `--last`
   selection, reports the build-cache size, and notes how many simulators are
   already booted.
@@ -115,7 +117,7 @@ Initial release.
 - Four navigation modes via the 2×2 of `gleis` / `gleis -d` / `gleis -w` / `gleis --last`
 - `gleis init` — interactive project setup, auto-detects SCHEME, PROJECT,
   and BUNDLE_ID from the Xcode project
-- `gleis doctor` — diagnose dependencies, Xcode setup, current project's
+- `gleis wartung` — diagnose dependencies, Xcode setup, current project's
   config, and connected iOS destinations
 - `gleis -l, --logs` — launch with the app console attached
 - `gleis --clean` — wipe per-worktree DerivedData before building
