@@ -163,6 +163,8 @@ gleis abfahrt               archive, export, deploy, print install URL
 gleis abfahrt setup-keychain
                             allow codesign to use the signing key
 gleis wartung               diagnose your gleis setup
+gleis doctor                alias for gleis wartung
+gleis leave                 alias for gleis abfahrt
 gleis prune                 remove build caches for deleted worktrees
 gleis prune --all           clear all gleis build caches
 gleis --version             print version
@@ -172,8 +174,9 @@ gleis -h, --help            show usage
 `gs` is installed as a short alias for the same command, so `gs --last`,
 `gs wartung`, and `gs abfahrt` work the same way as their `gleis` equivalents.
 
-Legacy names still work with a warning: `gleis doctor` runs `gleis wartung`,
-and `gleis ship` runs `gleis abfahrt`.
+The meme names stay canonical, but English aliases are supported too:
+`gleis doctor` runs `gleis wartung`, and `gleis leave` runs `gleis abfahrt`.
+The older `gleis ship` name still works with a warning.
 
 Worktree matching is not a separate command. Any plain argument is treated as a
 search string for the worktree path or branch. For example, `gleis login`

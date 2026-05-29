@@ -17,6 +17,8 @@
 #   gleis abfahrt                 archive, export, deploy, and print install URL
 #   gleis abfahrt setup-keychain  allow codesign to use the signing key
 #   gleis wartung                 diagnose your gleis setup
+#   gleis doctor                  alias for wartung
+#   gleis leave                   alias for abfahrt
 #   gleis prune                   remove build caches for deleted worktrees
 #   gleis prune --all             clear all gleis build caches
 #   gleis --version               print version
@@ -96,18 +98,22 @@ require_ship_tools() {
   $(printf '%s\n  ' "${hints[@]}")"
 }
 
-# Compatibility aliases for the 1.2.0 command rename. Keep the new names
-# canonical, but don't break muscle memory for users who upgraded in place.
+# Supported English aliases plus compatibility aliases for old command names.
+# Keep the German names canonical in output, but don't make the common English
+# entrypoints noisy.
 case "${1:-}" in
-  ship)
-    warn "'gleis ship' was renamed to 'gleis abfahrt'; running 'gleis abfahrt' instead"
+  leave)
     shift
     set -- abfahrt "$@"
     ;;
   doctor)
-    warn "'gleis doctor' was renamed to 'gleis wartung'; running 'gleis wartung' instead"
     shift
     set -- wartung "$@"
+    ;;
+  ship)
+    warn "'gleis ship' was renamed to 'gleis abfahrt'; running 'gleis abfahrt' instead"
+    shift
+    set -- abfahrt "$@"
     ;;
 esac
 

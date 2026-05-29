@@ -8,6 +8,8 @@ All notable changes to gleis.
 
 - The installer now adds `gs` as a short command alias for `gleis`, unless
   another `gs` command already exists.
+- `gleis doctor` is now a quiet supported alias for `gleis wartung`, and
+  `gleis leave` is a quiet supported alias for `gleis abfahrt`.
 
 ## [1.2.1] — 2026-05-28
 
