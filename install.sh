@@ -10,13 +10,15 @@ SCRIPT="$REPO_DIR/bin/gleis"
 
 # Pick the install target based on what's on PATH.
 if [[ -d /opt/homebrew/bin ]]; then
-  TARGET="/opt/homebrew/bin/gleis"
+  BIN_DIR="/opt/homebrew/bin"
 elif [[ -d /usr/local/bin ]]; then
-  TARGET="/usr/local/bin/gleis"
+  BIN_DIR="/usr/local/bin"
 else
   echo "error: neither /opt/homebrew/bin nor /usr/local/bin exists." >&2
   exit 1
 fi
+TARGET="$BIN_DIR/gleis"
+ALIAS_TARGET="$BIN_DIR/gs"
 
 c_green=$'\033[1;32m'; c_yellow=$'\033[1;33m'; c_reset=$'\033[0m'
 ok()   { printf "%s✓%s %s\n" "$c_green"  "$c_reset" "$*"; }
@@ -32,6 +34,21 @@ fi
 
 ln -s "$SCRIPT" "$TARGET"
 ok "linked $TARGET → $SCRIPT"
+
+if [[ -L "$ALIAS_TARGET" ]]; then
+  if [[ "$(readlink "$ALIAS_TARGET")" == "$SCRIPT" ]]; then
+    rm -f "$ALIAS_TARGET"
+    ln -s "$SCRIPT" "$ALIAS_TARGET"
+    ok "linked $ALIAS_TARGET → $SCRIPT"
+  else
+    warn "$ALIAS_TARGET already exists and points elsewhere — leaving it alone"
+  fi
+elif [[ -e "$ALIAS_TARGET" ]]; then
+  warn "$ALIAS_TARGET already exists and is not a symlink — leaving it alone"
+else
+  ln -s "$SCRIPT" "$ALIAS_TARGET"
+  ok "linked $ALIAS_TARGET → $SCRIPT"
+fi
 
 # Ensure config dir exists. We do NOT seed a default config — having one would
 # silently fall through as the config for any repo without its own .gleis.conf,
@@ -59,6 +76,6 @@ echo "Next step — tell gleis about an iOS project (once per project):"
 echo "  cd ~/Code/YourApp     # the main worktree of your iOS project"
 echo "  gleis init            # interactive setup; auto-detects most values"
 echo
-echo "Then 'gleis wartung' to verify, and 'gleis' to build + launch."
+echo "Then 'gleis wartung' to verify, and 'gleis' (or 'gs') to build + launch."
 echo "For OTA installs, run 'gleis abfahrt init' in the project, then 'gleis abfahrt'."
 echo "Detailed setup notes: $REPO_DIR/README.md"

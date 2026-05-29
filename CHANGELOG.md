@@ -2,6 +2,13 @@
 
 All notable changes to gleis.
 
+## Unreleased
+
+### Added
+
+- The installer now adds `gs` as a short command alias for `gleis`, unless
+  another `gs` command already exists.
+
 ## [1.2.1] — 2026-05-28
 
 ### Changed

@@ -5,11 +5,14 @@
 
 set -euo pipefail
 
+REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT="$REPO_DIR/bin/gleis"
+
 usage() {
   cat <<'EOF'
 Usage: ./uninstall.sh [--all|--purge]
 
-Removes the gleis symlink from PATH.
+Removes the gleis symlink and gs alias from PATH.
 
 Options:
   --all, --purge   also remove ~/.config/gleis and ~/Library/Caches/gleis
@@ -37,6 +40,19 @@ for target in /opt/homebrew/bin/gleis /usr/local/bin/gleis; do
   if [[ -L "$target" ]]; then
     rm -f "$target"
     echo "✓ removed symlink $target"
+  elif [[ -e "$target" ]]; then
+    echo "! $target exists but is not a symlink — leaving it alone"
+  fi
+done
+
+for target in /opt/homebrew/bin/gs /usr/local/bin/gs; do
+  if [[ -L "$target" ]]; then
+    if [[ "$(readlink "$target")" == "$SCRIPT" ]]; then
+      rm -f "$target"
+      echo "✓ removed symlink $target"
+    else
+      echo "! $target exists but points elsewhere — leaving it alone"
+    fi
   elif [[ -e "$target" ]]; then
     echo "! $target exists but is not a symlink — leaving it alone"
   fi

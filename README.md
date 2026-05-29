@@ -20,6 +20,8 @@ git add .gleis.conf && git commit -m "Add gleis config"
 gleis           # interactive picker
 gleis --last    # repeat last worktree + destination
 gleis wartung    # check setup if something looks off
+# or use gs as the short alias:
+gs --last
 ```
 
 That's the whole flow. Read on for the details.
@@ -32,7 +34,7 @@ cd ~/Developer/tools/gleis
 ./install.sh
 ```
 
-The installer symlinks `bin/gleis` into `/opt/homebrew/bin/` (or `/usr/local/bin/`), so updates flow through with `git pull` — no re-running install.
+The installer symlinks `bin/gleis` into `/opt/homebrew/bin/` (or `/usr/local/bin/`) as both `gleis` and the short alias `gs`, so updates flow through with `git pull` — no re-running install. If another `gs` command already exists, the installer leaves it alone and warns.
 
 Dependencies (installer will warn you if they're missing):
 
@@ -166,6 +168,9 @@ gleis prune --all           clear all gleis build caches
 gleis --version             print version
 gleis -h, --help            show usage
 ```
+
+`gs` is installed as a short alias for the same command, so `gs --last`,
+`gs wartung`, and `gs abfahrt` work the same way as their `gleis` equivalents.
 
 Legacy names still work with a warning: `gleis doctor` runs `gleis wartung`,
 and `gleis ship` runs `gleis abfahrt`.
