@@ -110,7 +110,7 @@ Required abfahrt config:
 
 ```sh
 TEAM_ID="ABCDE12345"
-SHIP_DOMAIN="install.example.app"
+SHIP_DOMAIN="kashew.app"
 VERCEL_PROJECT="your-vercel-project"
 ```
 

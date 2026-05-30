@@ -1094,7 +1094,7 @@ require_ship_config() {
   die "abfahrt config in $CONFIG_FILE is missing: ${missing[*]}
   add the abfahrt settings, e.g.:
     TEAM_ID=\"ABCDE12345\"
-    SHIP_DOMAIN=\"install.example.app\"
+    SHIP_DOMAIN=\"kashew.app\"
     VERCEL_PROJECT=\"your-vercel-project\"
   or fill them in interactively: gleis abfahrt init"
 }
@@ -1166,7 +1166,7 @@ abfahrt_init() {
 
   local team domain vercel
   team=$(_prompt   "TEAM_ID (Apple Developer team)"               "${TEAM_ID:-$d_team}")
-  domain=$(_prompt "SHIP_DOMAIN (install host, e.g. install.app)" "$SHIP_DOMAIN")
+  domain=$(_prompt "SHIP_DOMAIN (install host, e.g. kashew.app)" "$SHIP_DOMAIN")
   vercel=$(_prompt "VERCEL_PROJECT (Vercel deploy target)"        "$VERCEL_PROJECT")
 
   [[ -n "$team" && -n "$domain" && -n "$vercel" ]] \
